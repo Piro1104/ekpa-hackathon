@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from rafi.evaluate import make_targets
-from rafi.features import winter_closers
+from rafi.features import seasonal_factors, winter_closers
 from rafi.forecast import REASONS, forecast
 from rafi.ingest import build_deliveries, daily_qty, load_from_files
 
@@ -172,3 +172,30 @@ def test_submission_has_1975_rows_in_template_format(tmp_path):
     assert len(details) == 1975
     assert {"BASE_RATE", "SEASONAL_FACTOR_NOW", "STOCK_AT_CUTOFF", "REASON_CODE",
             "CONFIDENCE"} <= set(details.columns)
+
+
+# --- separate seasonal factors for winter closers ------------------------------
+
+def test_closer_and_open_customer_get_different_november_factor(data, official):
+    deliveries, customers, items = data
+    closers = set(winter_closers(deliveries, customers, CUTOFF)["TRDR"])
+    df = official.merge(customers[["TRDR", "AREA"]], on="TRDR").merge(
+        items[["MTRL", "MTRCATEGORY"]], on="MTRL")
+    crete_water = df[(df["AREA"] == "Κρήτη") & (df["MTRCATEGORY"] == "Νερά")]
+    closer_f = crete_water.loc[crete_water["TRDR"].isin(closers), "SEASONAL_FACTOR_NOW"]
+    open_f = crete_water.loc[~crete_water["TRDR"].isin(closers), "SEASONAL_FACTOR_NOW"]
+    assert len(closer_f) and len(open_f)
+    assert closer_f.nunique() == 1 and open_f.nunique() == 1   # one factor per group
+    assert open_f.iloc[0] > closer_f.iloc[0]                   # open shops still sell in November
+
+
+def test_group_without_data_uses_the_common_factor(data, official):
+    # No closers in Athens: Athens customers keep the common AREA x MTRCATEGORY factor.
+    deliveries, customers, items = data
+    common = seasonal_factors(deliveries, customers, items, CUTOFF)
+    nov = common[common["MONTH"] == 11].set_index(["AREA", "MTRCATEGORY"])["FACTOR"]
+    df = official.merge(customers[["TRDR", "AREA"]], on="TRDR").merge(
+        items[["MTRL", "MTRCATEGORY"]], on="MTRL")
+    athens = df[df["AREA"] == "Αθήνα"]
+    expected = [round(max(nov[(a, c)], 0.05), 3) for a, c in zip(athens["AREA"], athens["MTRCATEGORY"])]
+    assert list(athens["SEASONAL_FACTOR_NOW"]) == expected
