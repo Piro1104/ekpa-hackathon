@@ -30,7 +30,7 @@ def working_day(date, holidays=None):
     """True if deliveries can happen that day: not a Sunday and not a holiday."""
     holidays = load_holidays() if holidays is None else holidays
     date = pd.Timestamp(date).normalize()
-    return date.dayofweek != SUNDAY and date not in holidays
+    return date.day_of_week != SUNDAY and date not in holidays
 
 
 def next_working_day(date, holidays=None):
@@ -62,7 +62,7 @@ def _day_of_year(date):
     """Day of year in a non-leap calendar, so 'MM-DD' compares the same every year."""
     date = pd.Timestamp(date)
     day = min(date.day, 28) if date.month == 2 else date.day  # 29 Feb -> 28 Feb
-    return pd.Timestamp(REFERENCE_YEAR, date.month, day).dayofyear
+    return pd.Timestamp(REFERENCE_YEAR, date.month, day).day_of_year
 
 
 # --- route days ------------------------------------------------------------
