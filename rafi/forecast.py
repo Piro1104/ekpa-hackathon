@@ -25,6 +25,9 @@ NEW_CUSTOMER_MIN_DELIVERIES = 4  # (d) a new customer's pair needs this many to 
 # Seasonal factors without the winter closers. Tried and rejected: better on the 2025-10-31
 # backtest, worse on 2026-06-30 (closers then lose their own summer peak). Kept as a switch.
 FACTORS_WITHOUT_CLOSERS = False
+# Separate seasonal factors for winter closers (and likely closers) and for everyone else,
+# each AREA x MTRCATEGORY; a combination a group has no data for uses the common factor.
+SPLIT_CLOSER_FACTORS = True
 PEER_RECENT_DAYS = 180       # (d) peers' rates only from pairs bought in the last 180 days
 CONF_MAX = 0.95              # (e) best possible confidence for a normal forecast
 CONF_COLD_START = 0.30       # (e) confidence for a borrowed (cold start) rate
@@ -47,7 +50,10 @@ OUTPUT_COLUMNS = ["TRDR", "MTRL", "PREDICTED_DEPLETION_DATE", "SUGGESTED_QTY", "
 
 
 class SeasonCalendar:
-    """Daily seasonal factor per (AREA, MTRCATEGORY), with running sums.
+    """Daily seasonal factor per (GROUP, AREA, MTRCATEGORY), with running sums.
+
+    GROUP is "closer", "open" or "all" (the common factor). A combination missing
+    for a group falls back to the "all" factor of the same AREA x MTRCATEGORY.
 
     sum of factors over the days (a, b] = cum[b] - cum[a], so both the "seasonally weighted
     days" of an interval and the day-by-day depletion are simple look-ups.
@@ -59,13 +65,16 @@ class SeasonCalendar:
         self.month_idx = self.days.month.values - 1
         self.table = {}
         if use_seasonality:
-            for (area, cat), g in factors.groupby(["AREA", "MTRCATEGORY"]):
+            if "GROUP" not in factors:
+                factors = factors.assign(GROUP="all")
+            for key, g in factors.groupby(["GROUP", "AREA", "MTRCATEGORY"]):
                 f = g.sort_values("MONTH")["FACTOR"].to_numpy()
-                self.table[(area, cat)] = np.maximum(f, FACTOR_FLOOR)
+                self.table[key] = np.maximum(f, FACTOR_FLOOR)
         self._cum = {}
 
     def monthly(self, combo):
-        return self.table.get(combo, np.ones(12))
+        _, area, cat = combo
+        return self.table.get(combo, self.table.get(("all", area, cat), np.ones(12)))
 
     def factor(self, combo, date):
         return float(self.monthly(combo)[pd.Timestamp(date).month - 1])
@@ -151,11 +160,9 @@ def deplete(stock, start_date, rate, cal, combo, last_day):
     return cal.days[i]
 
 
-def _closure_status(customers, history, cutoff, use_closers):
+def _closure_status(customers, history, cutoff):
     """{TRDR: (closed_now, confidence)} for closers and likely closers."""
     out = {}
-    if not use_closers:
-        return out
     seen = set(history["TRDR"])
     for _, r in history[history["IS_CLOSER"]].iterrows():
         closed = is_closed_on(cutoff, r["LAST_BEFORE_CLOSE"], r["FIRST_AFTER_OPEN"])
@@ -170,15 +177,27 @@ def _closure_status(customers, history, cutoff, use_closers):
     return out
 
 
+def _group_factors(deliveries, customers, items, cutoff, closers):
+    """Common factors (GROUP "all") plus factors of the closers and of everyone else."""
+    parts = [seasonal_factors(deliveries, customers, items, cutoff).assign(GROUP="all"),
+             seasonal_factors(deliveries, customers, items, cutoff,
+                              include=closers).assign(GROUP="closer"),
+             seasonal_factors(deliveries, customers, items, cutoff,
+                              exclude=closers).assign(GROUP="open")]
+    return pd.concat(parts, ignore_index=True)
+
+
 def forecast(daily, deliveries, customers, items, targets, cutoff, k=K_DELIVERIES,
              use_seasonality=True, use_closers=True, use_cold_start=True,
-             factors_without_closers=FACTORS_WITHOUT_CLOSERS, factors=None):
+             factors_without_closers=FACTORS_WITHOUT_CLOSERS,
+             split_closer_factors=SPLIT_CLOSER_FACTORS, factors=None):
     """One row per target pair with the date, the quantity and the numbers that explain them.
 
     daily:      net quantity per TRDR, MTRL, TRNDATE (rafi.ingest.daily_qty)
     deliveries: clean deliveries (rafi.ingest.build_deliveries), for seasonality and closures
     The use_* switches turn steps off, for the ablation table in rafi.evaluate;
-    factors_without_closers leaves winter closers out of the seasonal factors.
+    factors_without_closers leaves winter closers out of the seasonal factors;
+    split_closer_factors gives closers (and likely closers) their own factors.
     `factors` may replace the AREA x MTRCATEGORY seasonal factors (same columns).
     """
     cutoff = pd.Timestamp(cutoff)
@@ -187,20 +206,28 @@ def forecast(daily, deliveries, customers, items, targets, cutoff, k=K_DELIVERIE
     deliveries = deliveries[deliveries["TRNDATE"] <= cutoff]
 
     history = winter_history(deliveries, customers, cutoff)
-    if factors is None:
-        exclude = history.loc[history["IS_CLOSER"], "TRDR"] if factors_without_closers else ()
+    closure = _closure_status(customers, history, cutoff)
+    known_closers = list(history.loc[history["IS_CLOSER"], "TRDR"])
+    if factors is None and split_closer_factors:
+        factors = _group_factors(deliveries, customers, items, cutoff, known_closers)
+    elif factors is None:
+        exclude = known_closers if factors_without_closers else ()
         factors = seasonal_factors(deliveries, customers, items, cutoff, exclude=exclude)
+    split = "GROUP" in factors and set(factors["GROUP"]) != {"all"}
     cal = SeasonCalendar(factors, daily["TRNDATE"].min() - pd.Timedelta(days=1),
                          horizon_last + pd.Timedelta(days=1), use_seasonality)
     area = customers.set_index("TRDR")["AREA"]
     tcat = customers.set_index("TRDR")["TRDCATEGORY"]
     mcat = items.set_index("MTRL")["MTRCATEGORY"]
-    combo_of = lambda trdr, mtrl: (area.get(trdr), mcat.get(mtrl))
+
+    def combo_of(trdr, mtrl):
+        group = ("closer" if trdr in closure else "open") if split else "all"
+        return group, area.get(trdr), mcat.get(mtrl)
+
     new_customers = set(customers.loc[pd.to_datetime(customers["INSDATE"]).dt.year == cutoff.year,
                                       "TRDR"])
     series = _pair_series(daily)
-
-    closure = _closure_status(customers, history, cutoff, use_closers)
+    closure_now = closure if use_closers else {}  # closures applied only if switched on
 
     peers = _peer_tables(series, daily, cal, combo_of, customers, new_customers, cutoff, k) \
         if use_cold_start else None
@@ -248,7 +275,7 @@ def forecast(daily, deliveries, customers, items, targets, cutoff, k=K_DELIVERIE
         else:
             reason = reason or "ΚΑΝΟΝΙΚΗ"
 
-        closed, closed_conf = closure.get(trdr, (False, None))
+        closed, closed_conf = closure_now.get(trdr, (False, None))
         if closed:
             date, reason, conf = None, "ΚΛΕΙΣΤΟ_ΧΕΙΜΩΝΑ", closed_conf
 

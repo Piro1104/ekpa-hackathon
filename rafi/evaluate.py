@@ -36,11 +36,15 @@ ABLATION = {
     "rolling180": METHODS["rolling180"],
     "rafi: μόνο ρυθμός": _rafi(use_seasonality=False, use_closers=False, use_cold_start=False),
     "+ εποχικότητα": _rafi(use_closers=False, use_cold_start=False,
-                           factors_without_closers=False),
-    "+ κλεισίματα": _rafi(use_cold_start=False, factors_without_closers=False),
-    "+ cold start": _rafi(factors_without_closers=False),
-    # One extra idea, kept only if it lowers MAE on both cutoffs (it does not).
-    "(δοκιμή) συντελ. χωρίς κλεισίματα": _rafi(factors_without_closers=True),
+                           factors_without_closers=False, split_closer_factors=False),
+    "+ κλεισίματα": _rafi(use_cold_start=False, factors_without_closers=False,
+                          split_closer_factors=False),
+    "+ cold start": _rafi(factors_without_closers=False, split_closer_factors=False),
+    "+ χωριστοί συντελ. closers": _rafi(factors_without_closers=False,
+                                         split_closer_factors=True),
+    # Rejected idea: lower MAE on 2025-10-31 but higher on 2026-06-30.
+    "(δοκιμή) συντελ. χωρίς κλεισίματα": _rafi(factors_without_closers=True,
+                                               split_closer_factors=False),
 }
 K_CANDIDATES = (3, 4, 6)
 CUTOFFS = ("2025-10-31", "2026-06-30")
