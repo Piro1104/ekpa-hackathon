@@ -45,7 +45,7 @@ def _conform(df, schema, sort_by):
     for col, dtype in schema.items():
         if dtype == "str":
             # Empty text (API) and missing value (CSV) mean the same thing.
-            df[col] = df[col].astype("str").replace({"": None, "nan": None, "None": None})
+            df[col] = df[col].replace("", pd.NA).astype("string")
         else:
             df[col] = df[col].astype(dtype)
     return df.sort_values(sort_by).reset_index(drop=True)
@@ -189,7 +189,11 @@ def main():
     args = ap.parse_args()
 
     if args.api:
-        headers, lines, items, _ = load_from_api(args.api)
+        try:
+            headers, lines, items, _ = load_from_api(args.api)
+        except requests.RequestException as e:
+            raise SystemExit(f"Δεν βρέθηκε το ERP στο {args.api} "
+                             f"(τρέχει το mock_erp_server.py;) — {type(e).__name__}")
     else:
         headers, lines, items, _ = load_from_files(args.data_dir)
     deliveries = build_deliveries(headers, lines, items)
