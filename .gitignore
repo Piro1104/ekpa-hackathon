@@ -10,3 +10,5 @@ venv/
 draft_orders/
 *.db
 .claude/settings.local.json
+# Generated submissions
+submissions/
