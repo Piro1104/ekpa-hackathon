@@ -1,0 +1,30 @@
+{
+  "TRDR": 1004,
+  "CUSTOMER_CODE": "30.00.0004",
+  "SALESMAN": 105,
+  "SUGGESTED_DELIVERY_DATE": "2026-11-02",
+  "REASON": "Παράδειγμα μορφής: εκτιμώμενη εξάντληση αποθέματος των ειδών εντός των επόμενων 3 εβδομάδων (ΜΗΝ χρησιμοποιηθούν οι τιμές).",
+  "LINES": [
+    {
+      "MTRL": 5016,
+      "ITEM_CODE": "10.02.008",
+      "QTY1": 4,
+      "PREDICTED_DEPLETION_DATE": "2026-11-06",
+      "CONFIDENCE": 0.8
+    },
+    {
+      "MTRL": 5017,
+      "ITEM_CODE": "10.02.009",
+      "QTY1": 6,
+      "PREDICTED_DEPLETION_DATE": "2026-11-12",
+      "CONFIDENCE": 0.6
+    },
+    {
+      "MTRL": 5021,
+      "ITEM_CODE": "10.03.001",
+      "QTY1": 3,
+      "PREDICTED_DEPLETION_DATE": "2026-11-19",
+      "CONFIDENCE": 0.5
+    }
+  ]
+}
