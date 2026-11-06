@@ -12,8 +12,7 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 SUNDAY = 6
 ROUTE_DAY_MIN_SHARE = 0.20   # a weekday is a route day if it has >= 20% of the customer's deliveries
-SUMMER_MONTHS = (6, 7, 8)    # a closer must have deliveries in these months...
-WINTER_MONTHS = (12, 1, 2)   # ...and none in these (December of year y to February of y+1)
+SUMMER_MONTHS = (6, 7, 8)    # a closer has deliveries in these months and none from Dec to Feb
 FACTOR_FLOOR = 0.05          # never divide by a (near) zero seasonal factor
 REFERENCE_YEAR = 2025        # non-leap year used to turn day-of-year back into a month-day
 
