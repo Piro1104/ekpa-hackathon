@@ -46,7 +46,7 @@ ABLATION = {
     "(δοκιμή) συντελ. χωρίς κλεισίματα": _rafi(factors_without_closers=True,
                                                split_closer_factors=False),
 }
-K_CANDIDATES = (3, 4, 6)
+K_CANDIDATES = (4, 5, 6, 8, 10)
 CUTOFFS = ("2025-10-31", "2026-06-30")
 
 

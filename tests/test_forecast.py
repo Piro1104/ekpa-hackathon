@@ -7,7 +7,7 @@ import pytest
 
 from rafi.evaluate import make_targets
 from rafi.features import seasonal_factors, winter_closers
-from rafi.forecast import REASONS, forecast
+from rafi.forecast import K_DELIVERIES, REASONS, forecast
 from rafi.ingest import build_deliveries, daily_qty, load_from_files
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,7 +65,8 @@ def test_hand_example_constant_rate():
     assert r["N_DELIVERIES"] == 3
     assert r["SUGGESTED_QTY"] == 10        # 1 box/day x factor 1 x 10 days between deliveries
     assert r["REASON_CODE"] == "ΚΑΝΟΝΙΚΗ"
-    assert r["CONFIDENCE"] == pytest.approx(0.95)  # identical intervals, full history
+    # identical intervals (CV = 0); history = 2 intervals out of k - 1
+    assert r["CONFIDENCE"] == pytest.approx(round(0.95 * min(1, 2 / (K_DELIVERIES - 1)), 2))
 
 
 def test_hand_example_with_november_factor_two():

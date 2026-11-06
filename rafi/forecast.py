@@ -18,7 +18,7 @@ import pandas as pd
 from rafi.features import (FACTOR_FLOOR, is_closed_on, likely_closer, seasonal_factors,
                            winter_history)
 
-K_DELIVERIES = 3             # (a) recent deliveries for the base rate (k - 1 intervals); 3 won the backtest over 4 and 6
+K_DELIVERIES = 10            # (a) recent deliveries for the base rate (k - 1 intervals); best of 4, 5, 6, 8, 10 on the backtest
 HORIZON_DAYS = 90            # (b) a depletion after cutoff + 90 days is left blank
 COLD_START_MIN_DELIVERIES = 2    # (d) fewer deliveries than this -> borrow the rate from peers
 NEW_CUSTOMER_MIN_DELIVERIES = 4  # (d) a new customer's pair needs this many to use its own rate
