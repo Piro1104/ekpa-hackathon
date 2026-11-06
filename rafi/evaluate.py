@@ -7,6 +7,7 @@ from functools import lru_cache
 import pandas as pd
 
 from rafi.baseline import plus30, rolling180
+from rafi.forecast import K_DELIVERIES, forecast
 from rafi.ingest import build_deliveries, daily_qty, load_from_files
 
 HORIZON_DAYS = 90
@@ -14,11 +15,39 @@ AT_RISK_DAYS = 14
 MISSING_PENALTY = 60
 KEYS = ["TRDR", "MTRL"]
 
-# Every method has the same signature: (daily, targets, cutoff) -> predictions.
+
+def _rafi(k=K_DELIVERIES, **switches):
+    """The rafi forecast as a method; `switches` turn steps off for the ablation table."""
+    def method(daily, targets, cutoff, deliveries, customers, items, **_):
+        return forecast(daily, deliveries, customers, items, targets, cutoff, k=k, **switches)
+    return method
+
+
+# Every method has the same signature: (daily, targets, cutoff, **ctx) -> predictions.
+# ctx holds deliveries, customers and items (all cut at the cutoff); baselines ignore it.
 METHODS = {
-    "plus30": lambda daily, targets, cutoff: plus30(targets, cutoff),
-    "rolling180": rolling180,
+    "plus30": lambda daily, targets, cutoff, **_: plus30(targets, cutoff),
+    "rolling180": lambda daily, targets, cutoff, **_: rolling180(daily, targets, cutoff),
+    "rafi": _rafi(),
 }
+
+# Ablation: each row adds one step to the one before; the last row is a rejected experiment.
+ABLATION = {
+    "rolling180": METHODS["rolling180"],
+    "rafi: μόνο ρυθμός": _rafi(use_seasonality=False, use_closers=False, use_cold_start=False),
+    "+ εποχικότητα": _rafi(use_closers=False, use_cold_start=False,
+                           factors_without_closers=False, split_closer_factors=False),
+    "+ κλεισίματα": _rafi(use_cold_start=False, factors_without_closers=False,
+                          split_closer_factors=False),
+    "+ cold start": _rafi(factors_without_closers=False, split_closer_factors=False),
+    "+ χωριστοί συντελ. closers": _rafi(factors_without_closers=False,
+                                         split_closer_factors=True),
+    # Rejected idea: lower MAE on 2025-10-31 but higher on 2026-06-30.
+    "(δοκιμή) συντελ. χωρίς κλεισίματα": _rafi(factors_without_closers=True,
+                                               split_closer_factors=False),
+}
+K_CANDIDATES = (4, 5, 6, 8, 10)
+CUTOFFS = ("2025-10-31", "2026-06-30")
 
 
 def _parse_one(value):
@@ -147,7 +176,7 @@ def proxy_truth(deliveries, targets, cutoff, horizon_days=HORIZON_DAYS):
 @lru_cache(maxsize=1)
 def _load(data_dir="data"):
     headers, lines, items, customers = load_from_files(data_dir)
-    return build_deliveries(headers, lines, items), customers
+    return build_deliveries(headers, lines, items), customers, items
 
 
 def _metrics_by(table, customers, column):
@@ -159,16 +188,18 @@ def _metrics_by(table, customers, column):
 def backtest(method, cutoff, data_dir="data"):
     """Cut the data at `cutoff`, build targets, run the method, score against proxy_truth.
 
-    `method` is a name from METHODS or a function (daily, targets, cutoff) -> predictions.
+    `method` is a name from METHODS or a function (daily, targets, cutoff, **ctx) -> predictions,
+    where ctx = deliveries, customers, items (deliveries cut at the cutoff).
     Returns a dict: overall metrics, per-pair table, and MAE by AREA, TRDCATEGORY, new/old.
     """
     fn = METHODS[method] if isinstance(method, str) else method
     cutoff = pd.Timestamp(cutoff)
-    deliveries, customers = _load(data_dir)
+    deliveries, customers, items = _load(data_dir)
 
     past = deliveries[deliveries["TRNDATE"] <= cutoff]
     targets = make_targets(past, customers, cutoff)
-    predictions = fn(daily_qty(past), targets, cutoff)
+    predictions = fn(daily_qty(past), targets, cutoff,
+                     deliveries=past, customers=customers, items=items)
     truth = proxy_truth(deliveries, targets, cutoff)
     table, metrics = score(predictions, truth, cutoff)
 
@@ -188,25 +219,55 @@ def _pct(x):
     return "   -" if pd.isna(x) else f"{100 * x:4.0f}%"
 
 
-def main():
-    cutoffs = ["2025-10-31", "2026-06-30"]
-    runs = {(m, c): backtest(m, c) for m in METHODS for c in cutoffs}
+def _row(r):
+    """One line of the ablation table: overall, by area, new/old, and the other metrics."""
+    k = r["metrics"]
+    row = {"MAE": k["MAE"]}
+    row.update(r["by_area"].set_index("AREA")["MAE"].to_dict())
+    row.update(r["by_new"].set_index("NEW_CUSTOMER")["MAE"].to_dict())
+    row.update({"±3": _pct(k["within_3"]), "±7": _pct(k["within_7"]),
+                "Precision": _pct(k["precision"]), "Recall": _pct(k["recall"])})
+    return row
 
+
+def _table(rows):
+    df = pd.DataFrame(rows).T
+    num = [c for c in df.columns if c not in ("±3", "±7", "Precision", "Recall")]
+    df[num] = df[num].astype(float).round(1)
+    return df.fillna("-").to_string()
+
+
+def main():
     print("Ράφι · backtest με «αλήθεια» = επόμενη πραγματική παράδοση (προσέγγιση)")
     print(f"{'Μέθοδος':<11} {'Cutoff':<10} {'n':>5} {'MAE':>6} {'±3':>5} {'±7':>5} "
           f"{'Precision':>9} {'Recall':>6}")
-    for (m, c), r in runs.items():
-        k = r["metrics"]
-        print(f"{m:<11} {c:<10} {k['n']:>5} {k['MAE']:>6.1f} {_pct(k['within_3']):>5} "
-              f"{_pct(k['within_7']):>5} {_pct(k['precision']):>9} {_pct(k['recall']):>6}")
+    for m in METHODS:
+        for c in CUTOFFS:
+            k = backtest(m, c)["metrics"]
+            print(f"{m:<11} {c:<10} {k['n']:>5} {k['MAE']:>6.1f} {_pct(k['within_3']):>5} "
+                  f"{_pct(k['within_7']):>5} {_pct(k['precision']):>9} {_pct(k['recall']):>6}")
 
-    print("\nMAE ανά περιοχή")
-    rows = {f"{m} {c}": r["by_area"].set_index("AREA")["MAE"] for (m, c), r in runs.items()}
-    print(pd.DataFrame(rows).round(1).to_string())
+    for c in CUTOFFS:
+        print(f"\nABLATION · cutoff {c} (κάθε γραμμή προσθέτει ένα βήμα· MAE σε ημέρες)")
+        print(_table({name: _row(backtest(fn, c)) for name, fn in ABLATION.items()}))
 
-    print("\nMAE νέοι / παλιοί πελάτες")
-    rows = {f"{m} {c}": r["by_new"].set_index("NEW_CUSTOMER")["MAE"] for (m, c), r in runs.items()}
-    print(pd.DataFrame(rows).round(1).to_string())
+    print("\nΔοκιμή k (πλήθος πρόσφατων παραδόσεων για τον ρυθμό) · MAE")
+    rows = {}
+    for k in K_CANDIDATES:
+        maes = [backtest(_rafi(k=k), c)["metrics"]["MAE"] for c in CUTOFFS]
+        rows[f"k = {k}"] = dict(zip(CUTOFFS, maes), **{"μέσος όρος": sum(maes) / len(maes)})
+    df = pd.DataFrame(rows).T.round(2)
+    print(df.to_string())
+    print(f"Καλύτερο στον μέσο όρο: {df['μέσος όρος'].idxmin()} (σε χρήση: k = {K_DELIVERIES})")
+
+    print("\nrafi · MAE ανά περιοχή και τύπο πελάτη")
+    cols = {}
+    for c in CUTOFFS:
+        r = backtest("rafi", c)
+        _, customers, _ = _load()
+        t = r["table"].merge(customers[["TRDR", "AREA", "TRDCATEGORY"]], on="TRDR")
+        cols[c] = t.groupby(["AREA", "TRDCATEGORY"])["ERROR"].mean()
+    print(pd.DataFrame(cols).round(1).to_string())
 
 
 if __name__ == "__main__":

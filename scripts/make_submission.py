@@ -1,4 +1,5 @@
-"""Write submissions/team_rafi.csv for all pairs of data/prediction_targets.csv.
+"""Write submissions/team_rafi.csv for all pairs of data/prediction_targets.csv,
+and submissions/forecast_details.csv with the numbers behind every forecast (for the dashboard).
 
 Run from the repository root: python scripts/make_submission.py
 """
@@ -11,7 +12,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from rafi.baseline import rolling180  # noqa: E402
+from rafi.forecast import forecast  # noqa: E402
 from rafi.ingest import build_deliveries, daily_qty, load_from_files  # noqa: E402
 
 CUTOFF = pd.Timestamp("2026-10-31")
@@ -20,22 +21,25 @@ EXPECTED_ROWS = 1975
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def build_submission(data_dir=ROOT / "data", method=rolling180):
-    """Run the method and return a DataFrame in the template's format and order."""
+def build_submission(data_dir=ROOT / "data"):
+    """Run the rafi forecast. Returns (submission in the template's format and order,
+    template, full forecast with the explanation columns)."""
     data_dir = Path(data_dir)
-    headers, lines, items, _ = load_from_files(data_dir)
+    headers, lines, items, customers = load_from_files(data_dir)
     deliveries = build_deliveries(headers, lines, items)
-    daily = daily_qty(deliveries[deliveries["TRNDATE"] <= CUTOFF])
+    past = deliveries[deliveries["TRNDATE"] <= CUTOFF]
 
     template = pd.read_csv(data_dir / "submission_template.csv", encoding="utf-8-sig")
     targets = pd.read_csv(data_dir / "prediction_targets.csv", encoding="utf-8-sig")
-    pred = method(daily, targets, CUTOFF)
+    details = forecast(daily_qty(past), past, customers, items, targets, CUTOFF)
 
-    out = template[["TRDR", "MTRL"]].merge(pred, on=["TRDR", "MTRL"], how="left")
-    out["PREDICTED_DEPLETION_DATE"] = (pd.to_datetime(out["PREDICTED_DEPLETION_DATE"])
+    out = template[["TRDR", "MTRL"]].merge(details, on=["TRDR", "MTRL"], how="left")
+    has_date = out["PREDICTED_DEPLETION_DATE"].notna()
+    out["PREDICTED_DEPLETION_DATE"] = (out["PREDICTED_DEPLETION_DATE"]
                                        .dt.strftime("%Y-%m-%d").fillna(""))
-    out["SUGGESTED_QTY"] = ""  # not filled yet
-    return out[list(template.columns)], template
+    # A quantity only where we expect the stock to run out inside the horizon.
+    out["SUGGESTED_QTY"] = out["SUGGESTED_QTY"].where(has_date).astype("Int64")
+    return out[list(template.columns)], template, details
 
 
 def check(sub, template):
@@ -61,19 +65,28 @@ def check(sub, template):
 
 
 def main(out_path=ROOT / "submissions" / "team_rafi.csv"):
-    sub, template = build_submission()
+    sub, template, details = build_submission()
     filled = check(sub, template)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sub.to_csv(out_path, index=False)
+    details_path = out_path.parent / "forecast_details.csv"
+    details.to_csv(details_path, index=False, date_format="%Y-%m-%d")
 
-    print("Ράφι · υποβολή (μέθοδος rolling180, cutoff 2026-10-31)")
+    print("Ράφι · υποβολή (μέθοδος rafi, cutoff 2026-10-31)")
     print(f"  Ζεύγη:                     {len(sub):>5,}")
     print(f"  Με ημερομηνία εξάντλησης:  {len(filled):>5,}")
-    print(f"  Κενά (μετά τον ορίζοντα):   {len(sub) - len(filled):>5,}")
+    print(f"  Κενά:                      {len(sub) - len(filled):>5,}")
+    blanks = details.loc[details["PREDICTED_DEPLETION_DATE"].isna(), "REASON_CODE"]
+    for reason, n in blanks.value_counts().items():
+        print(f"    {reason:<23} {n:>5,}")
     print(f"  At Risk (≤ 2026-11-14):    {int((filled <= AT_RISK_END).sum()):>5,}")
-    shown = out_path.relative_to(ROOT) if out_path.is_relative_to(ROOT) else out_path
-    print(f"  Γράφτηκε: {shown}")
+    print("  Όλα τα ζεύγη ανά REASON_CODE:")
+    for reason, n in details["REASON_CODE"].value_counts().items():
+        print(f"    {reason:<23} {n:>5,}")
+    for path in (out_path, details_path):
+        shown = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+        print(f"  Γράφτηκε: {shown}")
 
 
 if __name__ == "__main__":

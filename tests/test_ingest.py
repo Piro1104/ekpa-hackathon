@@ -168,7 +168,7 @@ def test_no_invoice_on_sunday_or_holiday(raw):
     dates = pd.to_datetime(headers["TRNDATE"])
     holidays = pd.to_datetime(pd.read_csv(DATA / "greek_holidays.csv", encoding="utf-8-sig")["DATE"])
     assert len(holidays) > 0
-    assert not (dates.dt.dayofweek == 6).any(), "invoice on a Sunday"
+    assert not (dates.dt.day_of_week == 6).any(), "invoice on a Sunday"
     assert not dates.isin(holidays).any(), "invoice on a public holiday"
 
 
