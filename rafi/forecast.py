@@ -118,7 +118,7 @@ def pair_rate(dates, qtys, cdates, cqtys, cal, combo, k=K_DELIVERIES):
     return rate, rates, lengths
 
 
-def confidence(rates, n_deliveries, k=K_DELIVERIES):
+def confidence(rates, k=K_DELIVERIES):
     """Step (e): CONFIDENCE = 0.95 x stability x history, between 0 and 1.
 
     stability = 1 / (1 + CV), CV = std / mean of the interval rates (1 if fewer than 2 intervals)
@@ -224,7 +224,7 @@ def forecast(daily, deliveries, customers, items, targets, cutoff, k=K_DELIVERIE
             conf = CONF_COLD_START
             reason = "ΝΕΟΣ_ΠΕΛΑΤΗΣ"
         else:
-            conf = confidence(rates, n, k) if rate else 0.0
+            conf = confidence(rates, k) if rate else 0.0
 
         # stock after the last delivery: its quantity minus credits that came after it
         last_date = pd.Timestamp(dates[-1]) if n else pd.NaT
