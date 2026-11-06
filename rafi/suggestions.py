@@ -413,7 +413,9 @@ def offer_suggestions(ctx, skip, text_writer=None):
         item_sales = p[(p["MTRL"] == mtrl)]
         sold_years = sorted(item_sales["TRNDATE"].dt.year.unique())
         sold_years = [y for y in sold_years if y < ctx.today.year]
-        ly = item_sales[(item_sales["TRNDATE"] >= ly_start) & (item_sales["TRNDATE"] <= ly_end)]
+        # net quantity in last year's window: returns (credits) are taken off
+        net = ctx.past[ctx.past["MTRL"] == mtrl]
+        ly = net[(net["TRNDATE"] >= ly_start) & (net["TRNDATE"] <= ly_end)]
         for trdr, qty in ly.groupby("TRDR")["QTY"].sum().items():
             if trdr in skip or trdr in ctx.closed or qty <= 0:
                 continue
