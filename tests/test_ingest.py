@@ -1,13 +1,8 @@
 """One test per data rule, using the real numbers of the organisers' data pack."""
-import socket
-import subprocess
-import sys
-import time
 from pathlib import Path
 
 import pandas as pd
 import pytest
-import requests
 
 from rafi.ingest import build_deliveries, daily_qty, load_from_api, load_from_files
 
@@ -172,35 +167,7 @@ def test_no_invoice_on_sunday_or_holiday(raw):
     assert not dates.isin(holidays).any(), "invoice on a public holiday"
 
 
-# --- Files and API give the same result ---------------------------------
-
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture(scope="module")
-def erp_url():
-    port = _free_port()
-    proc = subprocess.Popen([sys.executable, str(ROOT / "mock_erp_server.py"), "--port", str(port)],
-                            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    url = f"http://127.0.0.1:{port}"
-    try:
-        deadline = time.time() + 30
-        while True:
-            try:
-                requests.get(f"{url}/api/items", timeout=1).raise_for_status()
-                break
-            except requests.RequestException:
-                if proc.poll() is not None or time.time() > deadline:
-                    raise RuntimeError("mock ERP server did not start")
-                time.sleep(0.2)
-        yield url
-    finally:
-        proc.terminate()
-        proc.wait(timeout=10)
-
+# --- Files and API give the same result (erp_url: tests/conftest.py) -----
 
 def test_api_matches_files(raw, deliveries, erp_url):
     api = load_from_api(erp_url, page_size=1000)
