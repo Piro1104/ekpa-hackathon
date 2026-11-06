@@ -70,9 +70,10 @@ def main(out_path=ROOT / "submissions" / "team_rafi.csv"):
     print("Ράφι · υποβολή (μέθοδος rolling180, cutoff 2026-10-31)")
     print(f"  Ζεύγη:                     {len(sub):>5,}")
     print(f"  Με ημερομηνία εξάντλησης:  {len(filled):>5,}")
-    print(f"  Κενά (όχι μέσα στον ορίζ.):{len(sub) - len(filled):>5,}")
+    print(f"  Κενά (μετά τον ορίζοντα):   {len(sub) - len(filled):>5,}")
     print(f"  At Risk (≤ 2026-11-14):    {int((filled <= AT_RISK_END).sum()):>5,}")
-    print(f"  Γράφτηκε: {out_path.relative_to(ROOT)}")
+    shown = out_path.relative_to(ROOT) if out_path.is_relative_to(ROOT) else out_path
+    print(f"  Γράφτηκε: {shown}")
 
 
 if __name__ == "__main__":
