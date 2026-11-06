@@ -12,7 +12,6 @@ Nothing here talks to the ERP: suggestions are only proposals until someone appr
 import math
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from rafi.features import (is_closed_on, likely_closer, next_working_day, route_days,
@@ -388,7 +387,7 @@ def loss_suggestions(ctx, risks, text_writer=None):
 # --- (c) seasonal offers ---------------------------------------------------
 
 def seasonal_windows(ctx):
-    """{MTRL: (start, end) of this year's window} for seasonal items opening soon.
+    """{MTRL: (start, end, last year's start, last year's end)} for seasonal items opening soon.
 
     The window is last year's first and last sale date of the item, moved to this year.
     """
