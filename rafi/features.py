@@ -88,7 +88,7 @@ def route_days(deliveries, cutoff, min_share=ROUTE_DAY_MIN_SHARE):
 
 # --- seasonality -----------------------------------------------------------
 
-def seasonal_factors(deliveries, customers, items, cutoff):
+def seasonal_factors(deliveries, customers, items, cutoff, exclude=()):
     """Monthly factor per AREA x MTRCATEGORY.
 
     1. net quantity per AREA, MTRCATEGORY and calendar month (only complete months <= cutoff)
@@ -97,10 +97,12 @@ def seasonal_factors(deliveries, customers, items, cutoff):
 
     Returns a DataFrame: AREA, MTRCATEGORY, MONTH (1..12), FACTOR.
     A month with no data at all for a combination gets factor 1 before normalising.
+    `exclude`: customers left out (e.g. winter closers, whose closed months would
+    drag down the winter factors of the shops that stay open).
     """
     cutoff = pd.Timestamp(cutoff)
     last_full_month = (cutoff + pd.Timedelta(days=1)).to_period("M") - 1
-    d = deliveries[deliveries["TRNDATE"] <= cutoff]
+    d = deliveries[(deliveries["TRNDATE"] <= cutoff) & ~deliveries["TRDR"].isin(list(exclude))]
     d = d.merge(customers[["TRDR", "AREA"]], on="TRDR").merge(items[["MTRL", "MTRCATEGORY"]], on="MTRL")
     d = d.assign(PERIOD=d["TRNDATE"].dt.to_period("M"))
     d = d[d["PERIOD"] <= last_full_month]

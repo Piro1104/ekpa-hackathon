@@ -18,10 +18,13 @@ import pandas as pd
 from rafi.features import (FACTOR_FLOOR, is_closed_on, likely_closer, seasonal_factors,
                            winter_history)
 
-K_DELIVERIES = 4             # (a) how many recent deliveries give the base rate (k - 1 intervals)
+K_DELIVERIES = 3             # (a) recent deliveries for the base rate (k - 1 intervals); 3 won the backtest over 4 and 6
 HORIZON_DAYS = 90            # (b) a depletion after cutoff + 90 days is left blank
 COLD_START_MIN_DELIVERIES = 2    # (d) fewer deliveries than this -> borrow the rate from peers
 NEW_CUSTOMER_MIN_DELIVERIES = 4  # (d) a new customer's pair needs this many to use its own rate
+# Seasonal factors without the winter closers. Tried and rejected: better on the 2025-10-31
+# backtest, worse on 2026-06-30 (closers then lose their own summer peak). Kept as a switch.
+FACTORS_WITHOUT_CLOSERS = False
 PEER_RECENT_DAYS = 180       # (d) peers' rates only from pairs bought in the last 180 days
 CONF_MAX = 0.95              # (e) best possible confidence for a normal forecast
 CONF_COLD_START = 0.30       # (e) confidence for a borrowed (cold start) rate
@@ -168,12 +171,14 @@ def _closure_status(customers, history, cutoff, use_closers):
 
 
 def forecast(daily, deliveries, customers, items, targets, cutoff, k=K_DELIVERIES,
-             use_seasonality=True, use_closers=True, use_cold_start=True, factors=None):
+             use_seasonality=True, use_closers=True, use_cold_start=True,
+             factors_without_closers=FACTORS_WITHOUT_CLOSERS, factors=None):
     """One row per target pair with the date, the quantity and the numbers that explain them.
 
     daily:      net quantity per TRDR, MTRL, TRNDATE (rafi.ingest.daily_qty)
     deliveries: clean deliveries (rafi.ingest.build_deliveries), for seasonality and closures
-    The use_* switches turn steps off, for the ablation table in rafi.evaluate.
+    The use_* switches turn steps off, for the ablation table in rafi.evaluate;
+    factors_without_closers leaves winter closers out of the seasonal factors.
     `factors` may replace the AREA x MTRCATEGORY seasonal factors (same columns).
     """
     cutoff = pd.Timestamp(cutoff)
@@ -181,8 +186,10 @@ def forecast(daily, deliveries, customers, items, targets, cutoff, k=K_DELIVERIE
     daily = daily[daily["TRNDATE"] <= cutoff]
     deliveries = deliveries[deliveries["TRNDATE"] <= cutoff]
 
+    history = winter_history(deliveries, customers, cutoff)
     if factors is None:
-        factors = seasonal_factors(deliveries, customers, items, cutoff)
+        exclude = history.loc[history["IS_CLOSER"], "TRDR"] if factors_without_closers else ()
+        factors = seasonal_factors(deliveries, customers, items, cutoff, exclude=exclude)
     cal = SeasonCalendar(factors, daily["TRNDATE"].min() - pd.Timedelta(days=1),
                          horizon_last + pd.Timedelta(days=1), use_seasonality)
     area = customers.set_index("TRDR")["AREA"]
@@ -193,7 +200,6 @@ def forecast(daily, deliveries, customers, items, targets, cutoff, k=K_DELIVERIE
                                       "TRDR"])
     series = _pair_series(daily)
 
-    history = winter_history(deliveries, customers, cutoff)
     closure = _closure_status(customers, history, cutoff, use_closers)
 
     peers = _peer_tables(series, daily, cal, combo_of, customers, new_customers, cutoff, k) \
