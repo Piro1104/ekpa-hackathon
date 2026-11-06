@@ -1,0 +1,12 @@
+ # Python
+   __pycache__/
+   .venv/
+   venv/
+
+   # Secrets
+   .env
+
+   # Created while running
+   draft_orders/
+   *.db
+   .claude/settings.local.json
