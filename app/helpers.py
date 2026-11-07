@@ -3,7 +3,8 @@
 Formatting (Greek numbers and dates), labels for the store's codes, the split of
 suggestions into tabs, the home page numbers, history rows and the assistant call.
 """
-from datetime import date, datetime
+import re
+from datetime import date
 
 import pandas as pd
 
@@ -211,7 +212,9 @@ def home_metrics(suggestions):
 def summary(s, limit=120):
     """One line about the suggestion: the first sentence of its reason, shortened."""
     reason = str(s["payload"].get("REASON") or "").strip()
-    first = reason.split("· ")[0].split(". ")[0].rstrip(".")
+    # first clause: up to "· " or the end of a sentence (". " before a capital letter,
+    # so that "κιβ. 12τεμ" inside an item name does not cut it)
+    first = re.split(r"\.\s+(?=[«A-ZΑ-ΩΆΈΉΊΌΎΏ])", reason.split("· ")[0])[0].rstrip(".")
     if len(first) > limit:
         first = first[:limit - 1].rstrip() + "…"
     return first
@@ -320,8 +323,8 @@ def history_rows(entries, customers_map=None, items_map=None, salesmen=None):
         name, code = customers_map.get(int(h["trdr"]), (str(h["trdr"]), ""))
         rows.append({"Ημερομηνία": fmt_datetime(h["at"]), "Πελάτης": name, "Κωδικός": code,
                      "Τύπος": label(h["action_type"]), "Κίνηση": label(h["action"]),
-                     "Χρήστης": user_label(h["user"], salesmen),
-                     "Λεπτομέρειες": history_details(h, items_map), "_trdr": int(h["trdr"])})
+                     "Λεπτομέρειες": history_details(h, items_map),
+                     "Χρήστης": user_label(h["user"], salesmen), "_trdr": int(h["trdr"])})
     return rows
 
 
