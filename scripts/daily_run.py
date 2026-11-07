@@ -18,8 +18,8 @@ sys.path.insert(0, str(ROOT))
 from rafi import store  # noqa: E402
 from rafi.forecast import forecast  # noqa: E402
 from rafi.ingest import build_deliveries, daily_qty, load_from_files  # noqa: E402
-from rafi.suggestions import (EXTRA_ROUTE, LOSS, OFFER, ORDER, URGENT, WEEKDAYS,  # noqa: E402
-                              build_suggestions, load_promos)
+from rafi.suggestions import (EXTRA_ROUTE, LOSS, MARGINAL, OFFER, ORDER, URGENT,  # noqa: E402
+                              WEEKDAYS, build_suggestions, load_promos)
 
 TODAY = pd.Timestamp("2026-11-01")
 TOP = 10
@@ -59,6 +59,7 @@ def briefing(result, customers, salesmen, today=TODAY, db=None):
         out.append(f"  {kind:<19} {kinds.get(kind, 0):>4}")
     out.append(f"  {URGENT:<19} {flags.get(URGENT, 0):>4}")
     out.append(f"  {EXTRA_ROUTE:<19} {flags.get(EXTRA_ROUTE, 0):>4}")
+    out.append(f"  {MARGINAL:<19} {flags.get(MARGINAL, 0):>4}")
     out.append(f"Αξία σε κίνδυνο (παραγγελίες + κίνδυνοι απώλειας): {at_risk:>12,.2f} €")
     out.append(f"Αξία προτεινόμενων προσφορών (εποχικά):          {offers:>12,.2f} €")
     out.append("")
