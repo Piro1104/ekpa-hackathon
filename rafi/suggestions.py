@@ -17,6 +17,7 @@ import pandas as pd
 from rafi.features import (FACTOR_FLOOR, is_closed_on, likely_closer, next_working_day,
                            route_days, winter_history, working_day)
 from rafi.forecast import SPLIT_CLOSER_FACTORS, _closure_status, _group_factors
+from rafi.settings import extra_route_cost_eur
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
@@ -31,7 +32,8 @@ BASKET_ORDERS = 5            # "usual basket": items of the last 5 orders ...
 BASKET_MIN_ORDERS = 2        # ... that appear in at least 2 of them, with their median quantity
 SEASONAL_CATEGORY = "Εποχικά"
 SEASONAL_LOOKAHEAD_DAYS = 60  # offer seasonal items whose window opens within 60 days
-# Assumed cost of one extra delivery run (EUR). A setting: change it from the app's settings.
+# Default cost of one extra delivery run (EUR). The value in use comes from
+# config/settings.json (extra_route_cost_eur), set from the app's settings page.
 EXTRA_ROUTE_COST_EUR = 60
 
 WEEKDAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
@@ -85,7 +87,7 @@ def lost_sales_eur(rows, d1):
     return round(total, 2)
 
 
-def delivery_plan(earliest_depletion, days, today, lost_eur=math.inf):
+def delivery_plan(earliest_depletion, days, today, lost_eur=math.inf, route_cost=None):
     """Delivery date for an order, following the rules in order:
 
     F  = first working day after today; D1 = first route day >= F; D2 = next route day after D1
@@ -94,13 +96,16 @@ def delivery_plan(earliest_depletion, days, today, lost_eur=math.inf):
     - lost sales until D1 > 0 but < cost of an extra route -> still D1, marked ΟΡΙΑΚΟ
     - else last working day before it    -> extra route if it is not a route weekday
     - if that is before F                -> deliver on F, urgent
+    route_cost: cost of an extra route in EUR (default: from the settings file).
     Returns (delivery, D1, D2, flags).
     """
+    if route_cost is None:
+        route_cost = extra_route_cost_eur()
     first, d1, d2 = route_visits(days, today)
     flags = []
     if earliest_depletion >= d1 or lost_eur <= 0:
         delivery = d1
-    elif lost_eur < EXTRA_ROUTE_COST_EUR:
+    elif lost_eur < route_cost:
         delivery = d1
         flags.append(MARGINAL)
     else:
@@ -289,8 +294,9 @@ def write_texts(facts, text_writer=None):
 class _Context:
     """Look-ups shared by the three kinds of suggestion."""
 
-    def __init__(self, details, customers, items, deliveries, promos, today):
+    def __init__(self, details, customers, items, deliveries, promos, today, route_cost=None):
         self.today = pd.Timestamp(today).normalize()
+        self.route_cost = extra_route_cost_eur() if route_cost is None else route_cost
         self.cutoff = self.today - pd.Timedelta(days=1)
         self.first_day = next_working_day(self.today)
         self.past = deliveries[deliveries["TRNDATE"] <= self.cutoff]
@@ -392,7 +398,7 @@ def order_suggestions(ctx, skip, text_writer=None):
             [((r.BASE_RATE * r.SEASONAL_FACTOR_NOW) if pd.notna(r.BASE_RATE) else 0.0,
               r.PREDICTED_DEPLETION_DATE, float(ctx.items.at[r.MTRL, "PRICER"]))
              for r in early.itertuples(index=False)], d1)
-        delivery, d1, d2, flags = delivery_plan(earliest, days, ctx.today, lost)
+        delivery, d1, d2, flags = delivery_plan(earliest, days, ctx.today, lost, ctx.route_cost)
         g = g[g["PREDICTED_DEPLETION_DATE"] < d2].sort_values(["PREDICTED_DEPLETION_DATE", "MTRL"])
         if g.empty:
             continue
@@ -412,7 +418,7 @@ def order_suggestions(ctx, skip, text_writer=None):
                 "stock_at_cutoff": None if pd.isna(r.STOCK_AT_CUTOFF) else float(r.STOCK_AT_CUTOFF),
                 "promo_disc": disc})
         facts = {"next_visit": d2.strftime("%Y-%m-%d"), "usual_visit": d1.strftime("%Y-%m-%d"),
-                 "lost_eur": lost, "extra_route_cost_eur": EXTRA_ROUTE_COST_EUR,
+                 "lost_eur": lost, "extra_route_cost_eur": ctx.route_cost,
                  "lines": facts_lines}
         out.append(ctx.suggestion(ORDER, trdr, delivery, lines, flags, facts,
                                   lines[0]["PREDICTED_DEPLETION_DATE"], text_writer,
@@ -587,20 +593,33 @@ def _rank(suggestions):
     return ordered
 
 
-def build_suggestions(details, customers, items, deliveries, promos, today, text_writer=None):
+def build_suggestions(details, customers, items, deliveries, promos, today, text_writer=None,
+                      route_cost=None):
     """All suggestions for `today`, sorted by PRIORITY.
 
     details:    output of rafi.forecast.forecast (cutoff = today - 1)
     deliveries: clean deliveries (rafi.ingest.build_deliveries)
     promos:     PROMO.csv (load_promos)
     text_writer: optional function facts -> {"REASON", "SALES_NOTE"} (the LLM hook)
+    route_cost: cost of an extra route in EUR (default: from config/settings.json)
 
     A customer at loss risk gets only the loss-risk suggestion (no order, no offer).
     """
-    ctx = _Context(details, customers, items, deliveries, promos, today)
+    ctx = _Context(details, customers, items, deliveries, promos, today, route_cost)
     risks = loss_risks(ctx)
     at_risk = {r["TRDR"] for r in risks}
     out = (order_suggestions(ctx, at_risk, text_writer)
            + loss_suggestions(ctx, risks, text_writer)
            + offer_suggestions(ctx, at_risk, text_writer))
     return _rank(out)
+
+
+def pending_totals(pending):
+    """Values of the morning briefing, from stored suggestions (dicts of rafi.store).
+
+    at_risk_eur: orders + loss risks; offers_eur: offers. Used by scripts/daily_run.py and
+    by the dashboard, so both show the same numbers.
+    """
+    at_risk = sum(s["value_eur"] or 0.0 for s in pending if s["action_type"] in (ORDER, LOSS))
+    offers = sum(s["value_eur"] or 0.0 for s in pending if s["action_type"] == OFFER)
+    return {"at_risk_eur": at_risk, "offers_eur": offers}

@@ -20,7 +20,7 @@ from rafi.forecast import forecast  # noqa: E402
 from rafi.lgbm_engine import forecast_hybrid  # noqa: E402
 from rafi.ingest import build_deliveries, daily_qty, load_from_files  # noqa: E402
 from rafi.suggestions import (EXTRA_ROUTE, LOSS, MARGINAL, OFFER, ORDER, URGENT,  # noqa: E402
-                              WEEKDAYS, build_suggestions, load_promos)
+                              WEEKDAYS, build_suggestions, load_promos, pending_totals)
 
 TODAY = pd.Timestamp("2026-11-01")
 TOP = 10
@@ -54,8 +54,8 @@ def briefing(result, customers, salesmen, today=TODAY, db=None):
     people = salesmen.set_index("PRSN")["NAME"]
     kinds = Counter(s["action_type"] for s in pending)
     flags = Counter(f for s in pending for f in s["payload"].get("FLAGS", []))
-    at_risk = sum(s["value_eur"] for s in pending if s["action_type"] in (ORDER, LOSS))
-    offers = sum(s["value_eur"] for s in pending if s["action_type"] == OFFER)
+    totals = pending_totals(pending)
+    at_risk, offers = totals["at_risk_eur"], totals["offers_eur"]
 
     out = [f"Ράφι · πρωινή ενημέρωση · {WEEKDAYS[today.weekday()]} {today:%d/%m/%Y}",
            f"Νέες προτάσεις σήμερα: {len(result['saved'])} "
