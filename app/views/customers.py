@@ -75,9 +75,9 @@ if selected is None:
 s = selected
 sid, p = s["id"], s["payload"]
 name, code = ui.customer(s["trdr"])
-user = h.store_user(s)
+user = h.store_user()
 active = s["status"] == store.PROPOSED
-ai_text = p.get("TEXT_SOURCE") == "AI"
+ai_text = h.is_ai(p.get("TEXT_SOURCE"))
 
 st.subheader(name)
 st.markdown(f'<span class="ne-muted">{html.escape(code)}</span> &nbsp; '
@@ -100,8 +100,7 @@ st.markdown(f'<div class="ne-note">{html.escape(p.get("SALES_NOTE") or "—")}</
             unsafe_allow_html=True)
 
 st.markdown("**Είδη**")
-st.dataframe(pd.DataFrame(h.lines_rows(s, ui.items_map())), hide_index=True, width="stretch",
-             height=38 + 35 * len(p["LINES"]), column_config={"Ποσότητα": st.column_config.NumberColumn(format="%d")})
+ui.table(h.lines_frame(h.lines_rows(s, ui.items_map())), height=38 + 35 * len(p["LINES"]))
 
 # --- decisions -------------------------------------------------------------------
 

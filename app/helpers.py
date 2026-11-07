@@ -152,9 +152,17 @@ def user_label(user, salesmen=None):
     return u
 
 
-def store_user(s):
-    """User recorded in the store for actions from the dashboard."""
-    return str(s.get("salesman") or "admin")
+ADMIN = "admin"  # the dashboard has one user for now; shown as «Διαχειριστής»
+
+
+def store_user(s=None):
+    """User recorded in the store for every action from the dashboard."""
+    return ADMIN
+
+
+def is_ai(source):
+    """True only for text written by the assistant (source or TEXT_SOURCE equal to "AI")."""
+    return source == "AI"
 
 
 # --- tabs and home page ------------------------------------------------------
@@ -229,13 +237,45 @@ def item_lookup(items):
 
 
 def lines_rows(s, items_map):
-    """Rows of the items table of one suggestion."""
+    """Rows of the items table of one suggestion, with real values (int, Timestamp or None).
+
+    Earliest depletion first; lines without a date at the end.
+    """
     rows = []
     for l in s["payload"]["LINES"]:
         name, unit = items_map.get(int(l["MTRL"]), (l.get("ITEM_NAME") or str(l["MTRL"]), ""))
         rows.append({"Είδος": name, "Ποσότητα": int(l["QTY1"]), "Μονάδα": unit,
-                     "Προβλεπόμενη εξάντληση": fmt_date(l.get("PREDICTED_DEPLETION_DATE"))})
-    return rows
+                     "Τελειώνει": _to_date(l.get("PREDICTED_DEPLETION_DATE"))})
+    return sorted(rows, key=lambda r: (r["Τελειώνει"] is None, r["Τελειώνει"] or 0))
+
+
+def lines_frame(rows):
+    """DataFrame of lines_rows: the quantity keeps its unit in the display only."""
+    df = pd.DataFrame(rows, columns=["Είδος", "Ποσότητα", "Μονάδα", "Τελειώνει"])
+    df["Ποσότητα"] = df["Ποσότητα"].astype("int64")
+    df["Τελειώνει"] = pd.to_datetime(df["Τελειώνει"])
+    return df
+
+
+def fmt_day(d):
+    """'2026-11-02' -> 'Δευτ. 02/11' (short, for tables and cards). Empty -> '—'."""
+    t = _to_date(d)
+    return "—" if t is None else f"{WEEKDAYS_SHORT[t.weekday()]} {t:%d/%m}"
+
+
+# Display formats of the tables: the data stay numbers and dates (so sorting is right),
+# only what is shown is Greek.
+TABLE_FORMATS = {
+    "Ποσότητα": lambda x: fmt_qty(x),
+    "Αξία": lambda x: fmt_eur(x),
+    "Τελειώνει": lambda x: fmt_day(x),
+    "Ημερομηνία": lambda x: fmt_datetime(x),
+}
+
+
+def table_formats(df):
+    """{column: function} for the columns of df that have a Greek display format."""
+    return {c: f for c, f in TABLE_FORMATS.items() if c in df.columns}
 
 
 def changed_quantities(lines, new_values):
@@ -321,7 +361,7 @@ def history_rows(entries, customers_map=None, items_map=None, salesmen=None):
     rows = []
     for h in sorted(entries, key=lambda h: h["id"], reverse=True):
         name, code = customers_map.get(int(h["trdr"]), (str(h["trdr"]), ""))
-        rows.append({"Ημερομηνία": fmt_datetime(h["at"]), "Πελάτης": name, "Κωδικός": code,
+        rows.append({"Ημερομηνία": pd.Timestamp(h["at"]), "Πελάτης": name, "Κωδικός": code,
                      "Τύπος": label(h["action_type"]), "Κίνηση": label(h["action"]),
                      "Λεπτομέρειες": history_details(h, items_map),
                      "Χρήστης": user_label(h["user"], salesmen), "_trdr": int(h["trdr"])})
@@ -336,7 +376,8 @@ def ask_assistant(question, context):
     source is None when the text did not come from the assistant.
     """
     try:
-        from rafi import llm
+        import importlib
+        llm = importlib.import_module("rafi.llm")
         out = llm.answer(question, context)
         text = out.get("text") if isinstance(out, dict) else None
         if not text or not str(text).strip():

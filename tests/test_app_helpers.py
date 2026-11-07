@@ -87,8 +87,8 @@ def test_flag_labels_mark_marginal_orders_for_a_call():
 
 
 def test_users():
-    assert h.store_user({"salesman": 103}) == "103"
-    assert h.store_user({"salesman": None}) == "admin"
+    assert h.store_user({"salesman": 103}) == "admin"
+    assert h.user_label(h.store_user()) == "Διαχειριστής"
     assert h.user_label("system") == "Σύστημα"
     assert h.user_label("103", {103: "Ελένη"}) == "Ελένη"
 
@@ -154,8 +154,8 @@ ITEMS = pd.DataFrame({"MTRL": [5001, 5002], "NAME": ["Νερό 0,5L", "Νερό 
 def test_lines_rows_use_mtrl_names_and_units():
     rows = h.lines_rows(SAMPLE[0], h.item_lookup(ITEMS))
     assert rows[0] == {"Είδος": "Νερό 0,5L", "Ποσότητα": 4, "Μονάδα": "κιβ.",
-                       "Προβλεπόμενη εξάντληση": "Παρ. 06/11/2026"}
-    assert rows[1]["Μονάδα"] == "τεμ." and rows[1]["Προβλεπόμενη εξάντληση"] == "—"
+                       "Τελειώνει": pd.Timestamp("2026-11-06")}
+    assert rows[1]["Μονάδα"] == "τεμ." and rows[1]["Τελειώνει"] is None
 
 
 def test_only_changed_quantities_are_returned():
@@ -218,7 +218,8 @@ def test_history_rows_from_the_store(tmp_path):
     assert [r["Κίνηση"] for r in rows] == ["Διόρθωση", "Δημιουργία"]
     assert rows[0]["Πελάτης"] == "Hotel Ιόνιο" and rows[0]["Χρήστης"] == "Ελένη"
     assert rows[0]["Τύπος"] == "Παραγγελία"
-    assert re.match(r"^\S+ \d\d/\d\d/\d{4} \d\d:\d\d$", rows[0]["Ημερομηνία"])
+    assert isinstance(rows[0]["Ημερομηνία"], pd.Timestamp)
+    assert re.match(r"^\S+ \d\d/\d\d/\d{4} \d\d:\d\d$", h.fmt_datetime(rows[0]["Ημερομηνία"]))
 
 
 # --- assistant ---------------------------------------------------------------

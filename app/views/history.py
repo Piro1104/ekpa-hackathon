@@ -27,6 +27,5 @@ shown = [r for r in rows
 st.markdown(f'<p class="ne-muted">{len(shown)} από {len(rows)} κινήσεις</p>',
             unsafe_allow_html=True)
 if shown:
-    st.dataframe(pd.DataFrame(shown).drop(columns="_trdr"), hide_index=True, width="stretch",
-                 height=min(38 + 35 * len(shown), 640),
-                 column_config={"Λεπτομέρειες": st.column_config.TextColumn(width="large")})
+    ui.table(pd.DataFrame(shown).drop(columns="_trdr"), height=min(38 + 35 * len(shown), 640),
+             column_config={"Λεπτομέρειες": st.column_config.TextColumn(width="large")})

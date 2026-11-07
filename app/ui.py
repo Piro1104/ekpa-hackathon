@@ -95,6 +95,12 @@ def flag_badges(s):
     return "".join(out)
 
 
+def table(df, **kwargs):
+    """st.dataframe that sorts by the real values and shows them in Greek format."""
+    styled = df.style.format(h.table_formats(df), na_rep="—")
+    st.dataframe(styled, hide_index=True, width="stretch", **kwargs)
+
+
 # --- reference data ------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
@@ -175,7 +181,7 @@ def chat_box(key, context_fn, placeholder="Γράψε την ερώτησή σο
     for turn in log:
         st.markdown(f'<div class="ne-chat-q">{html.escape(turn["q"])}</div>',
                     unsafe_allow_html=True)
-        mark = ai_badge() + "<br>" if turn["source"] else ""
+        mark = ai_badge() + "<br>" if h.is_ai(turn["source"]) else ""
         st.markdown(f'<div class="ne-chat-a">{mark}{html.escape(turn["a"])}</div>',
                     unsafe_allow_html=True)
     with st.form(f"{key}_form", clear_on_submit=True, border=False):
