@@ -65,6 +65,10 @@ def test_order_delivery_before_every_depletion_unless_urgent_or_marginal(suggest
             assert d == FIRST_DAY
         elif MARGINAL in s["FLAGS"]:
             assert d == pd.Timestamp(s["FACTS"]["usual_visit"])  # waits for the usual visit
+        elif not s["FLAGS"] and d == min(_dep(l) for l in s["payload"]["LINES"]):
+            # runs out on the usual visit day: morning delivery on the normal route
+            assert d == pd.Timestamp(s["FACTS"]["usual_visit"]) and s["FACTS"]["lost_eur"] == 0
+            assert all(d <= _dep(l) for l in s["payload"]["LINES"])
         else:
             assert all(d < _dep(l) for l in s["payload"]["LINES"]), s["TRDR"]
 
@@ -89,8 +93,11 @@ def test_small_lost_sales_wait_for_the_route_large_ones_get_an_extra_run():
     assert d == d1 == pd.Timestamp("2026-11-04") and flags == [MARGINAL]
     d, _, _, flags = delivery_plan(dep, wed, TODAY, lost_eur=EXTRA_ROUTE_COST_EUR)
     assert d == FIRST_DAY and URGENT in flags and MARGINAL not in flags
-    d, _, _, flags = delivery_plan(pd.Timestamp("2026-11-04"), wed, TODAY, lost_eur=500)
+    d, _, _, flags = delivery_plan(pd.Timestamp("2026-11-04"), [3], TODAY, lost_eur=500)
     assert d == pd.Timestamp("2026-11-03") and flags == [EXTRA_ROUTE]
+    # nothing lost (runs out on D1) -> D1 without ΟΡΙΑΚΟ, whatever the threshold
+    d, d1, _, flags = delivery_plan(pd.Timestamp("2026-11-04"), wed, TODAY, lost_eur=0)
+    assert d == d1 and flags == []
 
 
 def test_lost_sales_decide_between_route_and_extra_run(suggestions):
@@ -99,9 +106,10 @@ def test_lost_sales_decide_between_route_and_extra_run(suggestions):
         assert p["LOST_EUR"] == lost and lost >= 0
         usual = pd.Timestamp(s["FACTS"]["usual_visit"])
         earliest = min(_dep(l) for l in p["LINES"])
-        if earliest > usual:
+        if earliest >= usual:
             assert not s["FLAGS"] and lost == 0
         elif lost < EXTRA_ROUTE_COST_EUR:
+            assert lost > 0
             assert s["FLAGS"] == [MARGINAL]
             assert "λιγότερες από το κόστος έκτακτου δρομολογίου" in p["REASON"]
             assert "επιβεβαιώσετε" in p["SALES_NOTE"]
@@ -124,11 +132,14 @@ def test_delivery_plan_rules():
     # depletion after the first route day -> usual route
     assert delivery_plan(pd.Timestamp("2026-11-10"), wed, TODAY)[0] == pd.Timestamp("2026-11-04")
     assert delivery_plan(pd.Timestamp("2026-11-10"), wed, TODAY)[3] == []
-    # depletion on the route day -> the working day before, extra route
+    # depletion on the route day -> that route day, no flag (morning delivery)
     d, d1, d2, flags = delivery_plan(pd.Timestamp("2026-11-04"), wed, TODAY)
-    assert (d, d1, d2) == (pd.Timestamp("2026-11-03"), pd.Timestamp("2026-11-04"),
+    assert (d, d1, d2) == (pd.Timestamp("2026-11-04"), pd.Timestamp("2026-11-04"),
                            pd.Timestamp("2026-11-11"))
-    assert flags == [EXTRA_ROUTE]
+    assert flags == []
+    # depletion the day before the route day -> the working day before it, extra route
+    d, _, _, flags = delivery_plan(pd.Timestamp("2026-11-04"), [3], TODAY)
+    assert d == pd.Timestamp("2026-11-03") and flags == [EXTRA_ROUTE]
     # already out -> first working day, urgent
     d, _, _, flags = delivery_plan(pd.Timestamp("2026-11-01"), wed, TODAY)
     assert d == FIRST_DAY and URGENT in flags
@@ -196,16 +207,31 @@ def test_no_closed_customer_gets_an_order(suggestions, data):
     assert not closed & {s["TRDR"] for s in _of(suggestions, ORDER)}
 
 
-def test_1127_is_a_loss_risk(suggestions):
+def test_1127_is_a_loss_risk(suggestions, data):
     loss = {s["TRDR"]: s for s in _of(suggestions, LOSS)}
     assert 1127 in loss
     assert loss[1127]["FACTS"]["last_delivery"] == "2026-08-17"
     assert loss[1127]["FACTS"]["days_early"] > 30
-    # basket in season: August orders, November delivery in Crete -> much smaller quantities
-    for fl, line in zip(loss[1127]["FACTS"]["lines"], loss[1127]["payload"]["LINES"]):
-        assert fl["season_scale"] < 1
+    # closed for the season now: the order is for the re-opening in April 2027
+    s = loss[1127]
+    d = pd.Timestamp(s["DELIVERY_DATE"])
+    assert s["FACTS"]["closed_now"]
+    assert (d.year, d.month) == (2027, 4)
+    assert d >= pd.Timestamp(s["FACTS"]["usual_reopen"])
+    assert working_day(d) and d.weekday() in data["routes"][1127] and not s["FLAGS"]
+    assert "κλειστό για τη σεζόν" in s["payload"]["REASON"]
+    assert "πώς πήγε η σεζόν" in s["payload"]["SALES_NOTE"]
+    for fl, line in zip(s["FACTS"]["lines"], s["payload"]["LINES"]):
         assert line["QTY1"] == max(1, math.ceil(fl["median_qty"] * fl["season_scale"] - 1e-9))
-        assert line["QTY1"] < fl["median_qty"]
+    # April quantities are larger than a November delivery would get
+    from rafi.suggestions import _Context, usual_basket
+    d0 = data
+    ctx = _Context(d0["details"], d0["customers"], d0["items"], d0["past"], d0["promos"], TODAY)
+    november = {m: q for m, q, *_ in usual_basket(ctx, 1127, FIRST_DAY)}
+    april = {l["MTRL"]: l["QTY1"] for l in s["payload"]["LINES"]}
+    assert april.keys() == november.keys()
+    assert all(april[m] >= november[m] for m in april)
+    assert sum(april.values()) > sum(november.values())
     assert 1127 not in {s["TRDR"] for s in suggestions if s["ACTION_TYPE"] != LOSS}
 
 

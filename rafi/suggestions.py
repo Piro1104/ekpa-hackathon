@@ -89,15 +89,16 @@ def delivery_plan(earliest_depletion, days, today, lost_eur=math.inf):
     """Delivery date for an order, following the rules in order:
 
     F  = first working day after today; D1 = first route day >= F; D2 = next route day after D1
-    - earliest depletion after D1        -> deliver on D1 (usual route)
-    - lost sales until D1 < cost of an extra route -> still D1, marked ΟΡΙΑΚΟ
+    - earliest depletion on or after D1, or nothing lost by waiting
+                                         -> deliver on D1 (usual route, morning delivery)
+    - lost sales until D1 > 0 but < cost of an extra route -> still D1, marked ΟΡΙΑΚΟ
     - else last working day before it    -> extra route if it is not a route weekday
     - if that is before F                -> deliver on F, urgent
     Returns (delivery, D1, D2, flags).
     """
     first, d1, d2 = route_visits(days, today)
     flags = []
-    if earliest_depletion > d1:
+    if earliest_depletion >= d1 or lost_eur <= 0:
         delivery = d1
     elif lost_eur < EXTRA_ROUTE_COST_EUR:
         delivery = d1
@@ -110,6 +111,12 @@ def delivery_plan(earliest_depletion, days, today, lost_eur=math.inf):
         if delivery.weekday() not in days:
             flags.append(EXTRA_ROUTE)
     return delivery, d1, d2, flags
+
+
+def _next_occurrence(month_day, today):
+    """First date after `today` with this 'MM-DD'."""
+    d = pd.Timestamp(f"{today.year}-{month_day}")
+    return d if d > today else pd.Timestamp(f"{today.year + 1}-{month_day}")
 
 
 def _same_day_last_occurrence(month_day, today):
@@ -128,6 +135,11 @@ def _dm(d):
 def _day(d):
     d = pd.Timestamp(d)
     return f"{WEEKDAYS[d.weekday()]} {_dm(d)}"
+
+
+def _day_year(d):
+    d = pd.Timestamp(d)
+    return f"{_day(d)}/{d.year}"
 
 
 def _num(x):
@@ -214,8 +226,21 @@ def template_texts(facts):
         if facts.get("usual_close"):
             reason += (f" Συνήθως κλείνει για τον χειμώνα γύρω στις {_dm(facts['usual_close'])}, "
                        f"άρα σταμάτησε {facts['days_early']} ημέρες νωρίτερα από το συνηθισμένο.")
-        reason += (f" Αγορές τελευταίων 12 μηνών: {_eur(facts['purchases_12m_eur'])} €."
-                   f" Προτείνουμε επικοινωνία και το συνηθισμένο καλάθι του "
+        reason += f" Αγορές τελευταίων 12 μηνών: {_eur(facts['purchases_12m_eur'])} €."
+        if facts.get("closed_now"):
+            reopen = facts["usual_reopen"]
+            reason += (f" Το κατάστημα είναι τώρα κλειστό για τη σεζόν. Προτείνουμε τηλεφώνημα "
+                       f"τώρα για να μάθουμε γιατί σταμάτησε νωρίτερα, και παραγγελία "
+                       f"επαναλειτουργίας για {_day_year(delivery)} (συνήθως ανοίγει γύρω στις "
+                       f"{_dm(reopen)}) με το συνηθισμένο καλάθι του ({len(lines)} είδη, "
+                       f"ποσότητες για τον {MONTHS[pd.Timestamp(delivery).month - 1]}).")
+            note = (f"{hello} Θέλαμε να μάθουμε πώς πήγε η σεζόν και αν είναι όλα εντάξει· "
+                    f"είδαμε ότι φέτος οι παραγγελίες σταμάτησαν από τις "
+                    f"{_dm(facts['last_delivery'])}. Για την επαναλειτουργία σας, να "
+                    f"κλειδώσουμε από τώρα μια παραγγελία για {_day_year(delivery)} με: "
+                    f"{_qty_list(lines)}; Αν θέλετε αλλαγές, τις κάνουμε μαζί.")
+            return {"REASON": reason, "SALES_NOTE": note}
+        reason += (f" Προτείνουμε επικοινωνία και το συνηθισμένο καλάθι του "
                    f"({len(lines)} είδη, ποσότητες προσαρμοσμένες στην εποχή) "
                    f"για {_day(delivery)}.")
         note = (f"{hello} Έχουμε να σας εξυπηρετήσουμε από τις {_dm(facts['last_delivery'])} "
@@ -417,14 +442,18 @@ def loss_risks(ctx):
             continue
         info = {"TRDR": int(trdr), "last_delivery": last.strftime("%Y-%m-%d"),
                 "median_interval": median, "days_silent": silent,
-                "usual_close": None, "days_early": None}
+                "usual_close": None, "days_early": None, "closed_now": False,
+                "usual_reopen": None}
         last_close, first_open = ctx.closure_dates(trdr)
         if last_close and is_closed_on(ctx.today, last_close, first_open):
             usual = _same_day_last_occurrence(last_close, ctx.today)
             early = (usual - last).days
             if early <= CLOSER_EARLY_DAYS:
                 continue  # the usual winter closure
-            info.update(usual_close=usual.strftime("%Y-%m-%d"), days_early=early)
+            # closed for the season now: the order is for the re-opening (default 1 April)
+            reopen = _next_occurrence(first_open or "04-01", ctx.today)
+            info.update(usual_close=usual.strftime("%Y-%m-%d"), days_early=early,
+                        closed_now=True, usual_reopen=reopen.strftime("%Y-%m-%d"))
         out.append(info)
     return out
 
@@ -459,7 +488,8 @@ def loss_suggestions(ctx, risks, text_writer=None):
     out = []
     for info in risks:
         trdr = info["TRDR"]
-        delivery = next_route_day(ctx.first_day, ctx.route(trdr))
+        start = pd.Timestamp(info["usual_reopen"]) if info["closed_now"] else ctx.first_day
+        delivery = next_route_day(start, ctx.route(trdr))
         basket = usual_basket(ctx, trdr, delivery)
         if not basket:
             continue
