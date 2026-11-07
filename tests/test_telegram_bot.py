@@ -504,3 +504,17 @@ def test_purchase_reject_fallback_with_other_reason(db):
     assert {r["status"] for r in rows} == {store.REJECTED}
     assert store.purchase_history(rows[0]["id"], db=path)[-1]["details"] == {
         "reason": "Άλλο — Αλλάζουμε προμηθευτή"}
+
+
+def test_customer_text_does_not_repeat_the_list_of_an_ai_note(monkeypatch):
+    from rafi import llm
+    monkeypatch.setenv("LLM_MODE", "mock")
+    s = {"trdr": 1001, "delivery_date": "2026-11-04", "payload": {
+        **suggestion(1001, 5016)["payload"], "TEXT_SOURCE": "AI"}}
+    s["payload"]["SALES_NOTE"] = llm.write_texts(s["payload"], "customer")["note"]
+    text = tb.customer_text(s)
+    assert text.count(llm.ITEMS_HEADER) == 1 and "Προτεινόμενη παράδοση" in text
+    assert "βοήθεια AI" in text
+    # a template note keeps the date and items added by the bot
+    s["payload"].update(SALES_NOTE="Καλημέρα σας.", TEXT_SOURCE="ΠΡΟΤΥΠΟ")
+    assert tb.customer_text(s).count(llm.ITEMS_HEADER) == 1

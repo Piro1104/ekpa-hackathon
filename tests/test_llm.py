@@ -201,9 +201,11 @@ def test_facts_dict_uses_suggestions_template(mode):
 
 
 def test_text_writer_adapter(ollama):
-    ollama["reply"] = reply("Προτείνουμε 4 κιβ. για 4/11.", "Να έρθουμε 4/11;")
-    assert llm.text_writer(ORDER_FACTS) == {"REASON": "Προτείνουμε 4 κιβ. για 4/11.",
-                                            "SALES_NOTE": "Να έρθουμε 4/11;"}
+    ollama["reply"] = reply("Προτείνουμε 4 κιβ. για 4/11.", "Καλημέρα σας!")
+    assert llm.text_writer(ORDER_FACTS) == {
+        "REASON": "Προτείνουμε 4 κιβ. για 4/11.",
+        "SALES_NOTE": "Καλημέρα σας!\n\nΠροτεινόμενη παράδοση: Τετάρτη 4/11/2026\n"
+                      "Είδη:\n• Νερό 0,5L: 4 κιβ."}
     ollama["reply"] = requests.Timeout("slow")
     assert llm.text_writer(ORDER_FACTS) == {}  # suggestions.py keeps its template
 
@@ -317,3 +319,60 @@ def test_cli_demo_reads_store(monkeypatch, mode, tmp_path, capsys):
     assert "Πρόταση 1" in out and "[MOCK]" in out
     summary = llm.suggestions_summary(store.list_suggestions(db=db))
     assert summary["σύνολο_προτάσεων"] == 1 and summary["προτάσεις"][0]["πελάτης"] == 1004
+
+
+# --- AI writes only the greeting; the code writes the list ----------------------
+
+def intro_reply(reason, intro):
+    return json.dumps({"reason": reason, "intro": intro}, ensure_ascii=False)
+
+
+def test_mock_sales_note_is_greeting_plus_code_list(mode):
+    out = llm.write_texts(ORDER_FACTS)
+    assert out["source"] == "AI"
+    assert out["note"] == (f"{llm.MOCK_TAG} {llm.MOCK_INTRO['customer']}\n\n"
+                           "Προτεινόμενη παράδοση: Τετάρτη 4/11/2026\nΕίδη:\n• Νερό 0,5L: 4 κιβ.")
+
+
+def test_mock_supplier_message_is_greeting_plus_code_list(mode):
+    out = llm.write_texts(SUPPLIER, kind="supplier")
+    assert out["note"] == (f"{llm.MOCK_TAG} {llm.MOCK_INTRO['supplier']}\n\n"
+                           "Είδη:\n• Νερό 0,5L: 120 κιβ.\nΠαράδοση έως: Δευτέρα 9/11/2026\n"
+                           + llm.SUPPLIER_ASK)
+
+
+def test_list_in_the_note_always_comes_from_the_code(ollama):
+    # the model tries to write its own (wrong) list: only 2 sentences are kept, and its
+    # quantity 40 is not in the input, so the template stays
+    ollama["reply"] = intro_reply("Παράδοση 4/11.", "Καλημέρα σας! Σας στέλνουμε την πρόταση. "
+                                                    "• Νερό 0,5L: 40 κιβ.")
+    out = llm.write_texts(ORDER_FACTS)
+    assert out["source"] == "AI"
+    assert out["note"].startswith("Καλημέρα σας! Σας στέλνουμε την πρόταση.\n\n")
+    assert "40" not in out["note"] and out["note"].endswith("• Νερό 0,5L: 4 κιβ.")
+    multi = {**ORDER_FACTS, "lines": ORDER_FACTS["lines"] + [
+        {"name": "Κόλα 330ml", "unit": "κιβ.", "qty": 2, "depletion": "2026-11-07",
+         "reason_code": "ΚΑΝΟΝΙΚΟ"}]}
+    ollama["reply"] = intro_reply("Παράδοση 4/11.", "Καλημέρα! Ετοιμάσαμε την παραγγελία σας.")
+    note = llm.write_texts(multi)["note"]
+    assert note.split("\n")[-2:] == ["• Νερό 0,5L: 4 κιβ.", "• Κόλα 330ml: 2 κιβ."]
+
+
+def test_intro_keeps_at_most_two_sentences(ollama):
+    ollama["reply"] = intro_reply("Αγορά 120 κιβ. έως 9/11.", "Καλημέρα σας! Ελπίζουμε όλα καλά. "
+                                                    "Τρίτη πρόταση που κόβεται.")
+    note = llm.write_texts(SUPPLIER, kind="supplier")["note"]
+    assert note.startswith("Καλημέρα σας! Ελπίζουμε όλα καλά.\n\nΕίδη:")
+    assert "Τρίτη" not in note
+
+
+def test_formal_dear_sir_falls_back_to_template(ollama):
+    ollama["reply"] = intro_reply("Παράδοση 4/11.", "Αγαπητέ κύριε/κυρία, σας γράφουμε.")
+    assert llm.write_texts(ORDER_FACTS)["source"] == "ΠΡΟΤΥΠΟ"
+
+
+def test_prompt_asks_only_for_a_greeting(ollama):
+    ollama["reply"] = intro_reply("Αγορά έως 9/11.", "Καλημέρα!")
+    assert llm.write_texts(SUPPLIER, kind="supplier")["source"] == "AI"
+    system = ollama["calls"][0]["body"]["messages"][0]["content"]
+    assert "1–2" in system and "Αγαπητέ" in system and '"intro"' in system

@@ -27,7 +27,7 @@ import requests
 from app import helpers as h
 from rafi import settings as rafi_settings
 from rafi import store
-from rafi.llm import _read_dotenv
+from rafi.llm import ITEMS_HEADER, _read_dotenv
 from rafi.suggestions import MARGINAL, ORDER
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -384,12 +384,16 @@ def send_brief(api, cfg, db=None):
 # --- customer message ---------------------------------------------------------
 
 def customer_text(s):
+    """SALES_NOTE, then the delivery date and the items. An AI note already ends with the
+    code's list (rafi.llm.note_block), so it is not repeated."""
     p = s["payload"]
+    note = p.get("SALES_NOTE") or ""
     text = []
-    if p.get("SALES_NOTE"):
-        text += [esc(p["SALES_NOTE"]), ""]
-    text += [f"Προτεινόμενη παράδοση: {h.fmt_date_long(s['delivery_date'])}", "Είδη:",
-             lines_text(s)]
+    if note:
+        text += [esc(note), ""]
+    if f"\n{ITEMS_HEADER}\n" not in note:
+        text += [f"Προτεινόμενη παράδοση: {h.fmt_date_long(s['delivery_date'])}", ITEMS_HEADER,
+                 lines_text(s)]
     if p.get("TEXT_SOURCE") == "AI":
         text += ["", "<i>Το κείμενο γράφτηκε με τη βοήθεια AI.</i>"]
     return "\n".join(text)
