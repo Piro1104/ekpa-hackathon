@@ -272,8 +272,9 @@ def forecast_hybrid(daily, deliveries, customers, items, targets, cutoff, k=K_DE
     model = lgb.train(LGBM_PARAMS, data, num_boost_round=NUM_ROUNDS)
 
     rafi_days = X_test["rafi_days"].to_numpy()
-    cold = (base["REASON_CODE"] == "ΝΕΟΣ_ΠΕΛΑΤΗΣ").to_numpy()
-    weight = np.where(cold, blend_weight * COLD_START_SHARE, blend_weight)
+
+    cold = (base["REASON_CODE"] == "ΝΕΟΣ_ΠΕΛΑΤΗΣ").to_numpy() | (X_test["is_new_customer"].to_numpy() == 1.0)
+    weight = np.where(cold, 0.0, blend_weight)
     days = weight * model.predict(X_test) + (1 - weight) * rafi_days
 
     movable = base["REASON_CODE"].isin(MOVABLE).to_numpy()
