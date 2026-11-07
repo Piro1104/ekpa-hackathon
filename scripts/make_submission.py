@@ -1,8 +1,10 @@
 """Write submissions/team_rafi.csv for all pairs of data/prediction_targets.csv,
 and submissions/forecast_details.csv with the numbers behind every forecast (for the dashboard).
 
-Run from the repository root: python scripts/make_submission.py
+Run from the repository root: python scripts/make_submission.py [--method hybrid|rafi]
+The default is the hybrid (rafi + LightGBM correction); --method rafi uses rafi alone.
 """
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -13,16 +15,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from rafi.forecast import forecast  # noqa: E402
+from rafi.lgbm_engine import forecast_hybrid  # noqa: E402
 from rafi.ingest import build_deliveries, daily_qty, load_from_files  # noqa: E402
 
 CUTOFF = pd.Timestamp("2026-10-31")
 AT_RISK_END = CUTOFF + pd.Timedelta(days=14)
 EXPECTED_ROWS = 1975
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+METHODS = {"hybrid": forecast_hybrid, "rafi": forecast}
+DEFAULT_METHOD = "hybrid"
 
 
-def build_submission(data_dir=ROOT / "data"):
-    """Run the rafi forecast. Returns (submission in the template's format and order,
+def build_submission(data_dir=ROOT / "data", method=DEFAULT_METHOD):
+    """Run the forecast (`method`: "hybrid" or "rafi"). Returns (submission in the template's format and order,
     template, full forecast with the explanation columns)."""
     data_dir = Path(data_dir)
     headers, lines, items, customers = load_from_files(data_dir)
@@ -31,7 +36,7 @@ def build_submission(data_dir=ROOT / "data"):
 
     template = pd.read_csv(data_dir / "submission_template.csv", encoding="utf-8-sig")
     targets = pd.read_csv(data_dir / "prediction_targets.csv", encoding="utf-8-sig")
-    details = forecast(daily_qty(past), past, customers, items, targets, CUTOFF)
+    details = METHODS[method](daily_qty(past), past, customers, items, targets, CUTOFF)
 
     out = template[["TRDR", "MTRL"]].merge(details, on=["TRDR", "MTRL"], how="left")
     has_date = out["PREDICTED_DEPLETION_DATE"].notna()
@@ -64,8 +69,8 @@ def check(sub, template):
     return filled
 
 
-def main(out_path=ROOT / "submissions" / "team_rafi.csv"):
-    sub, template, details = build_submission()
+def main(out_path=ROOT / "submissions" / "team_rafi.csv", method=DEFAULT_METHOD):
+    sub, template, details = build_submission(method=method)
     filled = check(sub, template)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,7 +78,7 @@ def main(out_path=ROOT / "submissions" / "team_rafi.csv"):
     details_path = out_path.parent / "forecast_details.csv"
     details.to_csv(details_path, index=False, date_format="%Y-%m-%d")
 
-    print("Ράφι · υποβολή (μέθοδος rafi, cutoff 2026-10-31)")
+    print(f"Ράφι · υποβολή (μέθοδος {method}, cutoff 2026-10-31)")
     print(f"  Ζεύγη:                     {len(sub):>5,}")
     print(f"  Με ημερομηνία εξάντλησης:  {len(filled):>5,}")
     print(f"  Κενά:                      {len(sub) - len(filled):>5,}")
@@ -90,4 +95,6 @@ def main(out_path=ROOT / "submissions" / "team_rafi.csv"):
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="Αρχείο υποβολής του Ράφι.")
+    ap.add_argument("--method", choices=list(METHODS), default=DEFAULT_METHOD)
+    main(method=ap.parse_args().method)
