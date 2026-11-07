@@ -518,3 +518,91 @@ def test_customer_text_does_not_repeat_the_list_of_an_ai_note(monkeypatch):
     # a template note keeps the date and items added by the bot
     s["payload"].update(SALES_NOTE="Καλημέρα σας.", TEXT_SOURCE="ΠΡΟΤΥΠΟ")
     assert tb.customer_text(s).count(llm.ITEMS_HEADER) == 1
+
+
+# --- message to the supplier after a purchase approval ----------------------------
+
+SUPPLIER_CFG = {**CFG, "TELEGRAM_SUPPLIER_CHAT_ID": "333"}
+
+
+def _approved_purchase(path, tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "PURCHASE_DIR", tmp_path / "po")
+    _real_warehouse(path)
+    from rafi.agents import warehouse_agent as wa
+    wa.approve_purchase_order("S07", "2026-11-02", "admin", db=path)
+
+
+def test_notify_supplier_sends_once(db, tmp_path, monkeypatch):
+    path, _ = db
+    _approved_purchase(path, tmp_path, monkeypatch)
+    message_mode(True)
+    api = FakeApi()
+    assert tb.supplier_notice("S07", "2026-11-02", api, SUPPLIER_CFG, path) == (True, "")
+    [msg] = api.sent("333")
+    lines = msg["text"].split("\n")
+    assert lines[0] == "Προς: Προμηθευτής S07 Α.Ε."
+    assert "Είδη:\n• Λαμπρυντικό: 36 τεμ.\nΠαράδοση έως: Δευτέρα 9/11/2026" in msg["text"]
+    assert not api.sent(ADMIN) and not api.sent(CUSTOMER)
+    hist = [e for e in store.purchase_history(db=path) if e["action"] == tb.SUPPLIER_MESSAGE]
+    assert len(hist) == 1 and hist[0]["user"] == "telegram"
+    # never a second time for the same order
+    ok, why = tb.supplier_notice("S07", "2026-11-02", api, SUPPLIER_CFG, path)
+    assert not ok and "ήδη" in why and len(api.sent("333")) == 1
+
+
+def test_notify_supplier_needs_the_setting_and_an_approved_order(db, tmp_path, monkeypatch):
+    path, _ = db
+    _approved_purchase(path, tmp_path, monkeypatch)
+    api = FakeApi()
+    message_mode(False)
+    assert tb.supplier_notice("S07", "2026-11-02", api, SUPPLIER_CFG, path)[0] is False
+    message_mode(True)
+    ok, why = tb.supplier_notice("S08", "2026-11-02", api, SUPPLIER_CFG, path)  # not approved
+    assert not ok and "εγκριθεί" in why
+    assert api.sent() == []
+
+
+def test_notify_supplier_without_chat_id_is_a_clear_message(db, tmp_path, monkeypatch):
+    path, _ = db
+    _approved_purchase(path, tmp_path, monkeypatch)
+    message_mode(True)
+    for k in tb.KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(tb, "_read_dotenv", lambda path: {})
+    api = FakeApi()
+    assert tb.supplier_notice("S07", "2026-11-02", api, CFG, path) == \
+        (False, "λείπει το TELEGRAM_SUPPLIER_CHAT_ID στο .env")
+    assert tb.notify_supplier("S07", "2026-11-02", db=path) is False  # no exception
+    assert api.sent() == []
+
+
+def test_bot_approval_messages_the_supplier(db, tmp_path, monkeypatch):
+    path, _ = db
+    monkeypatch.setattr(store, "PURCHASE_DIR", tmp_path / "po")
+    _real_warehouse(path)
+    message_mode(True)
+    api = FakeApi()
+    bot = tb.Bot(api, SUPPLIER_CFG, path)
+    press(bot, "pa:S07:2026-11-02")
+    assert api.texts(ADMIN)[-1] == "Η παραγγελία προμηθευτή εγκρίθηκε. Ο προμηθευτής ενημερώθηκε."
+    assert len(api.sent("333")) == 1
+    # without a supplier chat: approved, with a clear reason
+    api = FakeApi()
+    press(tb.Bot(api, CFG, path), "pa:S08:2026-11-02")
+    assert api.texts(ADMIN)[-1] == ("Η παραγγελία προμηθευτή εγκρίθηκε. Το μήνυμα στον "
+                                    "προμηθευτή δεν στάλθηκε: λείπει το "
+                                    "TELEGRAM_SUPPLIER_CHAT_ID στο .env.")
+
+
+def test_supplier_replies_reach_the_admin(db):
+    path, _ = db
+    api = FakeApi()
+    tb.Bot(api, SUPPLIER_CFG, path).handle(
+        {"update_id": 1, "message": {"text": "Εντάξει, έρχονται Δευτέρα", "chat": {"id": 333}}})
+    assert "Ο προμηθευτής του demo απάντησε" in api.texts(ADMIN)[-1]
+
+
+def test_whoami_roles():
+    assert tb.role_text(333, SUPPLIER_CFG) == "  ← προμηθευτής demo"
+    assert tb.role_text(111, SUPPLIER_CFG) == "  ← Διαχειριστής"
+    assert tb.role_text(9, SUPPLIER_CFG) == ""

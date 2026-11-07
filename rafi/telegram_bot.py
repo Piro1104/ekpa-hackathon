@@ -1,12 +1,14 @@
 """Telegram bot of Ράφι: morning brief and approvals for the Administrator, and the
-message to the customer of the demo after an approval.
+messages to the customer and to the supplier of the demo after an approval.
 
-Only the chat ids of .env are served (TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID);
-updates from any other chat are ignored. Nothing reaches the ERP without a button press,
-and approvals go through rafi.store, which never sends a suggestion twice.
+Only the chat ids of .env are served (TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID,
+TELEGRAM_SUPPLIER_CHAT_ID); updates from any other chat are ignored. Nothing reaches the
+ERP or a supplier without a button press, approvals go through rafi.store, which never
+sends a suggestion twice, and every message is sent once (it is written in the history).
 
 Settings (environment or .env in the repository root):
-  TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID
+  TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID,
+  TELEGRAM_SUPPLIER_CHAT_ID
 
 CLI: python -m rafi.telegram_bot whoami   chat ids of whoever pressed Start
      python -m rafi.telegram_bot brief    morning brief to the Administrator
@@ -38,6 +40,7 @@ API_URL = "https://api.telegram.org"
 POLL_SECONDS = 30
 BOT_USER = "telegram"            # user recorded in the store for actions from the bot
 CUSTOMER_MESSAGE = "ΜΗΝΥΜΑ_ΠΕΛΑΤΗ"  # history action written by notify_customer
+SUPPLIER_MESSAGE = "ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ"  # purchase history action written by notify_supplier
 WAREHOUSE_DAYS = 7
 MAX_BUTTONS = 30
 NOT_AVAILABLE = "δεν είναι διαθέσιμη ακόμα"
@@ -54,7 +57,10 @@ class TelegramError(Exception):
 
 # --- settings -----------------------------------------------------------------
 
-KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CUSTOMER_CHAT_ID")
+KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CUSTOMER_CHAT_ID",
+        "TELEGRAM_SUPPLIER_CHAT_ID")
+ROLES = {"TELEGRAM_ADMIN_CHAT_ID": "Διαχειριστής", "TELEGRAM_CUSTOMER_CHAT_ID": "πελάτης demo",
+         "TELEGRAM_SUPPLIER_CHAT_ID": "προμηθευτής demo"}
 
 
 def config(dotenv=ROOT / ".env"):
@@ -445,6 +451,77 @@ def notify_customer(suggestion_id) -> bool:
         return False
 
 
+# --- supplier message ---------------------------------------------------------
+
+def _approved_order(supplier_id, order_by, db=None):
+    """Approved purchase rows of one supplier order (same supplier and ORDER_BY)."""
+    return [r for r in store.list_purchase_suggestions(status=store.APPROVED, db=db)
+            if r["supplier_id"] == str(supplier_id) and r["order_by"] == str(order_by)[:10]]
+
+
+def supplier_text(rows):
+    """'Προς: <supplier>', the note to the supplier and, from the code, the exact items,
+    quantities and delivery date (rafi.llm.note_block)."""
+    from rafi import llm
+
+    p0 = rows[0]["payload"]
+    name = p0.get("SUPPLIER_NAME") or rows[0]["supplier_id"]
+    payload = {"SUPPLIER_NAME": name, "NEEDED_BY": max(r["arrival"] for r in rows),
+               "LINES": [{"ITEM_NAME": r["payload"].get("ITEM_NAME") or r["mtrl"],
+                          "QTY1": int(r["qty"]), "UNIT": r["payload"].get("UNIT") or ""}
+                         for r in rows]}
+    ids = sorted(r["id"] for r in rows)
+    note = p0.get("GROUP_NOTE") if p0.get("GROUP_IDS") == ids else None
+    if not note or f"\n{llm.ITEMS_HEADER}\n" not in note:
+        note = llm.compose_note(llm.HELLO, payload, "supplier")  # greeting + exact list
+    text = [f"Προς: {esc(name)}", "", esc(note)]
+    if p0.get("GROUP_IDS") == ids and p0.get("GROUP_NOTE_SOURCE") == llm.AI:
+        text += ["", "<i>Το κείμενο γράφτηκε με τη βοήθεια AI.</i>"]
+    return "\n".join(text)
+
+
+def supplier_notice(supplier_id, order_by, api=None, cfg=None, db=None):
+    """Message the demo supplier about an approved purchase order: (sent, why not).
+
+    Sends only when after_approval_mode is "draft_and_message", the order is approved,
+    TELEGRAM_SUPPLIER_CHAT_ID is set and the supplier was not messaged for it before.
+    Writes ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ in the purchase history of every line of the order.
+    """
+    if rafi_settings.load_settings().get("after_approval_mode") != rafi_settings.DRAFT_AND_MESSAGE:
+        return False, "η ρύθμιση «Μετά την έγκριση» δεν ζητά μήνυμα"
+    cfg = cfg or config()
+    chat = cfg.get("TELEGRAM_SUPPLIER_CHAT_ID")
+    if not chat:
+        return False, "λείπει το TELEGRAM_SUPPLIER_CHAT_ID στο .env"
+    rows = _approved_order(supplier_id, order_by, db)
+    if not rows:
+        return False, "η παραγγελία δεν έχει εγκριθεί"
+    ids = [r["id"] for r in rows]
+    if any(e["action"] == SUPPLIER_MESSAGE for e in store.purchase_history(db=db)
+           if e["purchase_id"] in ids):
+        return False, "ο προμηθευτής έχει ήδη ενημερωθεί για αυτή την παραγγελία"
+    try:
+        send(api or _default_api(cfg), chat, supplier_text(rows))
+    except TelegramError as e:
+        log.warning("notify_supplier: %s", e)
+        return False, "το Telegram δεν απάντησε"
+    with store._purchase_transaction(db) as conn:
+        for pid in ids:
+            store._purchase_log(conn, pid, BOT_USER, SUPPLIER_MESSAGE,
+                                {"Κανάλι": "Telegram", "Προμηθευτής": str(supplier_id),
+                                 "Παραγγελία έως": h.fmt_date(order_by), "Είδη": len(rows)})
+    return True, ""
+
+
+def notify_supplier(supplier_id, order_by, db=None) -> bool:
+    """Message the demo supplier about an approved purchase order. True if it was sent."""
+    try:
+        return supplier_notice(supplier_id, order_by, db=db)[0]
+    except (TelegramError, store.StoreError) as e:
+        log.warning("notify_supplier: %s", e)
+        return False
+
+
 # --- bot ----------------------------------------------------------------------
 
 def _erp_message(e):
@@ -460,6 +537,7 @@ class Bot:
         self.api, self.cfg, self.db = api, cfg, db
         self.admin = str(cfg.get("TELEGRAM_ADMIN_CHAT_ID") or "")
         self.customer = str(cfg.get("TELEGRAM_CUSTOMER_CHAT_ID") or "")
+        self.supplier = str(cfg.get("TELEGRAM_SUPPLIER_CHAT_ID") or "")
         self.waiting = {}   # chat id -> ("ask", id) | ("reject", id) | ("preject", sup, date)
         self.bulk = {}      # chat id -> ids shown in the bulk confirmation
         self.offset = None
@@ -487,6 +565,10 @@ class Bot:
         if self.customer and chat == self.customer:
             if text and not text.startswith("/"):
                 self.say(f"Ο πελάτης του demo απάντησε:\n«{esc(text)}»")
+            return True
+        if self.supplier and chat == self.supplier:
+            if text and not text.startswith("/"):
+                self.say(f"Ο προμηθευτής του demo απάντησε:\n«{esc(text)}»")
             return True
         return False  # unknown chat: ignored
 
@@ -768,7 +850,15 @@ class Bot:
         except store.StoreError as e:
             self.say(esc(h.humanize(e)))
             return
-        self.say("Η παραγγελία προμηθευτή εγκρίθηκε.")
+        sent, why = supplier_notice(sup, order_by, self.api, self.cfg, self.db)
+        if sent:
+            self.say("Η παραγγελία προμηθευτή εγκρίθηκε. Ο προμηθευτής ενημερώθηκε.")
+        elif rafi_settings.load_settings().get("after_approval_mode") == \
+                rafi_settings.DRAFT_AND_MESSAGE:
+            self.say(f"Η παραγγελία προμηθευτή εγκρίθηκε. Το μήνυμα στον προμηθευτή δεν "
+                     f"στάλθηκε: {esc(why)}.")
+        else:
+            self.say("Η παραγγελία προμηθευτή εγκρίθηκε.")
 
     def reject_purchase(self, sup, order_by, reason):
         try:
@@ -816,6 +906,12 @@ def whoami(api):
     return list(seen.items())
 
 
+def role_text(chat_id, cfg):
+    """'  ← Διαχειριστής' when the chat id is one of the .env settings."""
+    roles = [ROLES[k] for k in ROLES if cfg.get(k) and str(cfg[k]) == str(chat_id)]
+    return f"  ← {', '.join(roles)}" if roles else ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m rafi.telegram_bot",
                                  description="Telegram bot του Ράφι.")
@@ -834,7 +930,10 @@ def main(argv=None):
             if not people:
                 print("Κανένα μήνυμα. Άνοιξε το bot στο Telegram, πάτα Start και ξανατρέξε.")
             for chat_id, name in people:
-                print(f"{chat_id}\t{name}")
+                print(f"{chat_id}\t{name}{role_text(chat_id, cfg)}")
+            print()
+            for key in ROLES:
+                print(f"{key}={cfg[key] or '(κενό)'}")
             return 0
         if not cfg["TELEGRAM_ADMIN_CHAT_ID"]:
             print("Λείπει το TELEGRAM_ADMIN_CHAT_ID στο .env (δες: whoami).", file=sys.stderr)
