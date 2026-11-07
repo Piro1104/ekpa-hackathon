@@ -14,13 +14,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from rafi.features import (is_closed_on, likely_closer, next_working_day, route_days,
-                           winter_history, working_day)
+from rafi.features import (FACTOR_FLOOR, is_closed_on, likely_closer, next_working_day,
+                           route_days, winter_history, working_day)
+from rafi.forecast import SPLIT_CLOSER_FACTORS, _closure_status, _group_factors
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 ORDER, LOSS, OFFER = "ΠΑΡΑΓΓΕΛΙΑ", "ΚΙΝΔΥΝΟΣ_ΑΠΩΛΕΙΑΣ", "ΠΡΟΣΦΟΡΑ"
-URGENT, EXTRA_ROUTE = "ΕΠΕΙΓΟΝ", "ΕΚΤΑΚΤΟ_ΔΡΟΜΟΛΟΓΙΟ"
+URGENT, EXTRA_ROUTE, MARGINAL = "ΕΠΕΙΓΟΝ", "ΕΚΤΑΚΤΟ_ΔΡΟΜΟΛΟΓΙΟ", "ΟΡΙΑΚΟ"
 CLOSED = "ΚΛΕΙΣΤΟ_ΧΕΙΜΩΝΑ"
 
 LOSS_GAP_FACTOR = 3          # silent for more than 3 x the usual order interval ...
@@ -30,6 +31,8 @@ BASKET_ORDERS = 5            # "usual basket": items of the last 5 orders ...
 BASKET_MIN_ORDERS = 2        # ... that appear in at least 2 of them, with their median quantity
 SEASONAL_CATEGORY = "Εποχικά"
 SEASONAL_LOOKAHEAD_DAYS = 60  # offer seasonal items whose window opens within 60 days
+# Assumed cost of one extra delivery run (EUR). A setting: change it from the app's settings.
+EXTRA_ROUTE_COST_EUR = 60
 
 WEEKDAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
 MONTHS = ["Ιανουάριο", "Φεβρουάριο", "Μάρτιο", "Απρίλιο", "Μάιο", "Ιούνιο", "Ιούλιο",
@@ -63,21 +66,42 @@ def last_working_before(date):
     return d
 
 
-def delivery_plan(earliest_depletion, days, today):
+def route_visits(days, today):
+    """(F, D1, D2): first working day after today, first route day >= F, next route day after D1."""
+    first = next_working_day(today)
+    d1 = next_route_day(first, days)
+    d2 = next_route_day(d1 + pd.Timedelta(days=1), days)
+    return first, d1, d2
+
+
+def lost_sales_eur(rows, d1):
+    """Sales lost if we wait for D1: for every (rate per day, depletion, price) running out
+    on or before D1, rate x days without stock until D1 x price."""
+    total = 0.0
+    for rate, depletion, price in rows:
+        days = (d1 - pd.Timestamp(depletion)).days
+        if rate and days > 0:
+            total += rate * days * price
+    return round(total, 2)
+
+
+def delivery_plan(earliest_depletion, days, today, lost_eur=math.inf):
     """Delivery date for an order, following the rules in order:
 
     F  = first working day after today; D1 = first route day >= F; D2 = next route day after D1
     - earliest depletion after D1        -> deliver on D1 (usual route)
+    - lost sales until D1 < cost of an extra route -> still D1, marked ΟΡΙΑΚΟ
     - else last working day before it    -> extra route if it is not a route weekday
     - if that is before F                -> deliver on F, urgent
     Returns (delivery, D1, D2, flags).
     """
-    first = next_working_day(today)
-    d1 = next_route_day(first, days)
-    d2 = next_route_day(d1 + pd.Timedelta(days=1), days)
+    first, d1, d2 = route_visits(days, today)
     flags = []
     if earliest_depletion > d1:
         delivery = d1
+    elif lost_eur < EXTRA_ROUTE_COST_EUR:
+        delivery = d1
+        flags.append(MARGINAL)
     else:
         delivery = last_working_before(earliest_depletion)
         if delivery < first:
@@ -111,7 +135,13 @@ def _num(x):
     return s.replace(".", ",")
 
 
+def _eur(x):
+    return f"{x:,.0f}".replace(",", ".")
+
+
 def _route_note(flags):
+    if MARGINAL in flags:
+        return "κανονικό δρομολόγιο"
     if URGENT in flags and EXTRA_ROUTE in flags:
         return "επείγον, έκτακτο δρομολόγιο"
     if URGENT in flags:
@@ -147,6 +177,15 @@ def template_texts(facts):
         if len(lines) > 1:
             parts.append(f"άλλα {len(lines) - 1} είδη τελειώνουν πριν την επόμενη κανονική "
                          f"επίσκεψη ({_day(facts['next_visit'])})")
+        lost = _eur(facts["lost_eur"])
+        cost = _eur(facts["extra_route_cost_eur"])
+        if MARGINAL in facts["flags"]:
+            parts.append(f"εκτιμώμενες χαμένες πωλήσεις ~{lost} € μέχρι την κανονική επίσκεψη, "
+                         f"λιγότερες από το κόστος έκτακτου δρομολογίου (~{cost} €)")
+        elif URGENT in facts["flags"] or EXTRA_ROUTE in facts["flags"]:
+            parts.append(f"εκτιμώμενες χαμένες πωλήσεις ~{lost} € αν περιμέναμε την κανονική "
+                         f"επίσκεψη ({_day(facts['usual_visit'])}), περισσότερες από το κόστος "
+                         f"έκτακτου δρομολογίου (~{cost} €)")
         parts.append(f"παράδοση {_day(delivery)} ({_route_note(facts['flags'])})")
         reason = "· ".join(parts) + "."
         promo = [l for l in lines if l.get("promo_disc")]
@@ -155,8 +194,13 @@ def template_texts(facts):
                 f"«{l['name']}» −{l['promo_disc']}%" for l in promo) + "."
         when = ("έχει μάλλον ήδη τελειώσει" if f["reason_code"] == "ΗΔΗ_ΕΞΑΝΤΛΗΜΕΝΟ"
                 else f"μάλλον τελειώνει γύρω στις {_dm(f['depletion'])}")
-        note = (f"{hello} Από τις παραγγελίες σας βλέπουμε ότι το «{f['name']}» {when}. "
-                f"Σας προτείνουμε παράδοση {_day(delivery)} με: {_qty_list(lines)}.")
+        note = f"{hello} Από τις παραγγελίες σας βλέπουμε ότι το «{f['name']}» {when}. "
+        if MARGINAL in facts["flags"]:
+            note += (f"Η κανονική μας επίσκεψη είναι {_day(delivery)}. Μπορείτε να μας "
+                     f"επιβεβαιώσετε ότι σας φτάνει το απόθεμα μέχρι τότε; Εκείνη τη μέρα σας "
+                     f"προτείνουμε: {_qty_list(lines)}.")
+        else:
+            note += f"Σας προτείνουμε παράδοση {_day(delivery)} με: {_qty_list(lines)}."
         if promo:
             note += " " + " ".join(f"Το «{l['name']}» έχει έκπτωση {l['promo_disc']}% εκείνη τη μέρα."
                                    for l in promo)
@@ -170,8 +214,10 @@ def template_texts(facts):
         if facts.get("usual_close"):
             reason += (f" Συνήθως κλείνει για τον χειμώνα γύρω στις {_dm(facts['usual_close'])}, "
                        f"άρα σταμάτησε {facts['days_early']} ημέρες νωρίτερα από το συνηθισμένο.")
-        reason += (f" Προτείνουμε επικοινωνία και το συνηθισμένο καλάθι του "
-                   f"({len(lines)} είδη) για {_day(delivery)}.")
+        reason += (f" Αγορές τελευταίων 12 μηνών: {_eur(facts['purchases_12m_eur'])} €."
+                   f" Προτείνουμε επικοινωνία και το συνηθισμένο καλάθι του "
+                   f"({len(lines)} είδη, ποσότητες προσαρμοσμένες στην εποχή) "
+                   f"για {_day(delivery)}.")
         note = (f"{hello} Έχουμε να σας εξυπηρετήσουμε από τις {_dm(facts['last_delivery'])} "
                 f"και θέλαμε να δούμε αν όλα πάνε καλά ή αν χρειάζεστε κάτι διαφορετικό. "
                 f"Μπορούμε να σας φέρουμε {_day(delivery)} τα συνηθισμένα σας: "
@@ -179,14 +225,17 @@ def template_texts(facts):
         return {"REASON": reason, "SALES_NOTE": note}
 
     # OFFER (seasonal items)
-    bought = ", ".join(f"{l['last_year_qty']} {l['unit']} «{l['name']}»" for l in lines)
+    season = ", ".join(f"{l['last_year_total']} {l['unit']} «{l['name']}»" for l in lines)
+    first = ", ".join(f"{l['qty']} {l['unit']} «{l['name']}»" for l in lines)
     w = lines[0]
-    reason = (f"Πέρσι ο πελάτης πήρε {bought} στην περίοδο "
+    reason = (f"Πέρσι ο πελάτης πήρε συνολικά {season} στην περίοδο "
               f"{_dm(w['window_start'])}–{_dm(w['window_end'])}. Τα εποχικά πωλούνται ξανά "
-              f"από {_dm(w['window_start'])}· προτείνουμε την ίδια ποσότητα με παράδοση "
-              f"{_day(delivery)} ({_route_note(facts['flags'])}).")
-    note = (f"{hello} Ξεκινά η περίοδος για τα εποχικά. Πέρσι πήρατε {bought}. "
-            f"Να σας κρατήσουμε την ίδια ποσότητα για παράδοση {_day(delivery)};")
+              f"από {_dm(w['window_start'])}· επειδή είναι ευπαθή, προτείνουμε όσο η περσινή "
+              f"πρώτη παράδοση ({first}) με παράδοση {_day(delivery)} "
+              f"({_route_note(facts['flags'])}).")
+    note = (f"{hello} Ξεκινά η περίοδος για τα εποχικά. Για αρχή σας προτείνουμε {first}, "
+            f"όσο και στην πρώτη παραγγελία σας πέρσι, με παράδοση {_day(delivery)}. "
+            f"Να το ετοιμάσουμε;")
     return {"REASON": reason, "SALES_NOTE": note}
 
 
@@ -231,6 +280,17 @@ class _Context:
         self.details = d
         self.closed = set(d.loc[d["REASON_CODE"] == CLOSED, "TRDR"])
 
+        # seasonal factors exactly as the forecast uses them (closer / open groups)
+        self.closure = _closure_status(customers, self.history, self.cutoff)
+        closers = list(self.history.loc[self.history["IS_CLOSER"], "TRDR"])
+        f = _group_factors(self.past, customers, items, self.cutoff, closers)
+        self.factors = {(g, a, c, m): max(v, FACTOR_FLOOR) for g, a, c, m, v in
+                        zip(f["GROUP"], f["AREA"], f["MTRCATEGORY"], f["MONTH"], f["FACTOR"])}
+
+        year_ago = self.cutoff - pd.Timedelta(days=365)
+        last12 = self.past[self.past["TRNDATE"] > year_ago]
+        self.value_12m = last12.groupby("TRDR")["LINEVAL"].sum().round(2).to_dict()
+
     def route(self, trdr):
         return self.routes.get(int(trdr), [])
 
@@ -242,6 +302,13 @@ class _Context:
             return (r["LAST_BEFORE_CLOSE"], r["FIRST_AFTER_OPEN"]) if r["IS_CLOSER"] else (None, None)
         likely, last, first = likely_closer(trdr, self.customers.reset_index(), self.history)
         return (last, first) if likely else (None, None)
+
+    def factor(self, trdr, mtrl, month):
+        """Seasonal factor of the forecast for this customer's group, area and item category."""
+        group = ("closer" if trdr in self.closure else "open") if SPLIT_CLOSER_FACTORS else "all"
+        area, cat = self.customers.at[trdr, "AREA"], self.items.at[mtrl, "MTRCATEGORY"]
+        return self.factors.get((group, area, cat, month),
+                                self.factors.get(("all", area, cat, month), 1.0))
 
     def promo(self, mtrl, date):
         """Best active discount (%) for the item on that date, or None."""
@@ -260,7 +327,8 @@ class _Context:
                                              else None),
                 "CONFIDENCE": None if conf is None else round(float(conf), 2)}
 
-    def suggestion(self, kind, trdr, delivery, lines, flags, facts, earliest, text_writer):
+    def suggestion(self, kind, trdr, delivery, lines, flags, facts, earliest, text_writer,
+                   extra=None):
         c = self.customers.loc[trdr]
         facts = {"action_type": kind, "trdr": int(trdr), "customer_name": str(c["NAME"]),
                  "area": str(c["AREA"]), "delivery_date": delivery.strftime("%Y-%m-%d"),
@@ -273,6 +341,7 @@ class _Context:
             "REASON": texts["REASON"], "SALES_NOTE": texts["SALES_NOTE"],
             "TEXT_SOURCE": texts["TEXT_SOURCE"],
             "RAFI_SUGGESTION_ID": None,  # set by rafi.store when saved
+            **(extra or {}),
             "LINES": lines,
         }
         value = round(sum(l["QTY1"] * l["PRICER"] for l in lines), 2)
@@ -292,7 +361,13 @@ def order_suggestions(ctx, skip, text_writer=None):
     for trdr, g in d.groupby("TRDR"):
         days = ctx.route(trdr)
         earliest = g["PREDICTED_DEPLETION_DATE"].min()
-        delivery, d1, d2, flags = delivery_plan(earliest, days, ctx.today)
+        _, d1, _ = route_visits(days, ctx.today)
+        early = g[g["PREDICTED_DEPLETION_DATE"] <= d1]
+        lost = lost_sales_eur(
+            [((r.BASE_RATE * r.SEASONAL_FACTOR_NOW) if pd.notna(r.BASE_RATE) else 0.0,
+              r.PREDICTED_DEPLETION_DATE, float(ctx.items.at[r.MTRL, "PRICER"]))
+             for r in early.itertuples(index=False)], d1)
+        delivery, d1, d2, flags = delivery_plan(earliest, days, ctx.today, lost)
         g = g[g["PREDICTED_DEPLETION_DATE"] < d2].sort_values(["PREDICTED_DEPLETION_DATE", "MTRL"])
         if g.empty:
             continue
@@ -312,9 +387,11 @@ def order_suggestions(ctx, skip, text_writer=None):
                 "stock_at_cutoff": None if pd.isna(r.STOCK_AT_CUTOFF) else float(r.STOCK_AT_CUTOFF),
                 "promo_disc": disc})
         facts = {"next_visit": d2.strftime("%Y-%m-%d"), "usual_visit": d1.strftime("%Y-%m-%d"),
+                 "lost_eur": lost, "extra_route_cost_eur": EXTRA_ROUTE_COST_EUR,
                  "lines": facts_lines}
         out.append(ctx.suggestion(ORDER, trdr, delivery, lines, flags, facts,
-                                  lines[0]["PREDICTED_DEPLETION_DATE"], text_writer))
+                                  lines[0]["PREDICTED_DEPLETION_DATE"], text_writer,
+                                  extra={"LOST_EUR": lost}))
     return out
 
 
@@ -352,18 +429,30 @@ def loss_risks(ctx):
     return out
 
 
-def usual_basket(ctx, trdr):
-    """Items of the customer's last orders with their median quantity: [(MTRL, qty, share)]."""
+def usual_basket(ctx, trdr, delivery):
+    """Items of the customer's last orders: [(MTRL, qty, share, median qty, season scale)].
+
+    qty = median quantity x (seasonal factor of the delivery month
+                             / mean factor of the months of the orders it came from),
+    rounded up, at least 1. Factors are the forecast's (same closer / open group).
+    """
     p = ctx.past[(ctx.past["TRDR"] == trdr) & (ctx.past["QTY"] > 0) & ~ctx.past["IS_CREDIT"]]
     seasonal = ctx.items.index[ctx.items["MTRCATEGORY"] == SEASONAL_CATEGORY]
     p = p[~p["MTRL"].isin(seasonal)]
     last_dates = sorted(p["TRNDATE"].unique())[-BASKET_ORDERS:]
     recent = p[p["TRNDATE"].isin(last_dates)]
-    per_item = recent.groupby(["MTRL", "TRNDATE"])["QTY"].sum().groupby(level=0)
-    stats = pd.DataFrame({"N": per_item.size(), "QTY": per_item.median()})
-    keep = stats[stats["N"] >= min(BASKET_MIN_ORDERS, len(last_dates))]
-    return [(int(m), max(1, math.ceil(r.QTY - 1e-9)), r.N / len(last_dates))
-            for m, r in keep.sort_index().iterrows()]
+    per_order = recent.groupby(["MTRL", "TRNDATE"])["QTY"].sum()
+    out = []
+    for mtrl, s in per_order.groupby(level=0):
+        if len(s) < min(BASKET_MIN_ORDERS, len(last_dates)):
+            continue
+        months = [pd.Timestamp(t).month for t in s.index.get_level_values("TRNDATE")]
+        then = sum(ctx.factor(trdr, mtrl, m) for m in months) / len(months)
+        scale = ctx.factor(trdr, mtrl, delivery.month) / then
+        median = float(s.median())
+        qty = max(1, math.ceil(median * scale - 1e-9))
+        out.append((int(mtrl), qty, len(s) / len(last_dates), median, round(scale, 3)))
+    return out
 
 
 def loss_suggestions(ctx, risks, text_writer=None):
@@ -371,14 +460,16 @@ def loss_suggestions(ctx, risks, text_writer=None):
     for info in risks:
         trdr = info["TRDR"]
         delivery = next_route_day(ctx.first_day, ctx.route(trdr))
-        basket = usual_basket(ctx, trdr)
+        basket = usual_basket(ctx, trdr, delivery)
         if not basket:
             continue
-        lines = [ctx.line(m, q, None, share) for m, q, share in basket]
+        lines = [ctx.line(m, q, None, share) for m, q, share, _, _ in basket]
         facts = {**{k: v for k, v in info.items() if k != "TRDR"},
-                 "lines": [{"name": l["ITEM_NAME"], "qty": l["QTY1"],
+                 "purchases_12m_eur": float(ctx.value_12m.get(trdr, 0.0)),
+                 "lines": [{"name": l["ITEM_NAME"], "qty": l["QTY1"], "median_qty": med,
+                            "season_scale": scale,
                             "unit": UNITS.get(ctx.items.at[l["MTRL"], "MTRUNIT1"], "")}
-                           for l in lines]}
+                           for l, (_, _, _, med, scale) in zip(lines, basket)]}
         flags = [] if delivery.weekday() in ctx.route(trdr) else [EXTRA_ROUTE]
         out.append(ctx.suggestion(LOSS, trdr, delivery, lines, flags, facts, None, text_writer))
     return out
@@ -415,24 +506,28 @@ def offer_suggestions(ctx, skip, text_writer=None):
         # net quantity in last year's window: returns (credits) are taken off
         net = ctx.past[ctx.past["MTRL"] == mtrl]
         ly = net[(net["TRNDATE"] >= ly_start) & (net["TRNDATE"] <= ly_end)]
-        for trdr, qty in ly.groupby("TRDR")["QTY"].sum().items():
-            if trdr in skip or trdr in ctx.closed or qty <= 0:
+        # last year's first delivery of the item to each customer inside the window
+        bought = ly[ly["QTY"] > 0].groupby(["TRDR", "TRNDATE"])["QTY"].sum()
+        first_qty = bought.groupby(level=0).first()
+        for trdr, total in ly.groupby("TRDR")["QTY"].sum().items():
+            if trdr in skip or trdr in ctx.closed or total <= 0 or trdr not in first_qty:
                 continue
             delivery = next_route_day(max(start, ctx.first_day), ctx.route(trdr))
             if delivery > end:
                 continue
             bought_years = set(years[(p["MTRL"] == mtrl) & (p["TRDR"] == trdr)])
             conf = len(bought_years & set(sold_years)) / max(1, len(sold_years))
-            by_customer.setdefault((trdr, delivery), []).append((mtrl, int(qty), conf, start, end))
+            by_customer.setdefault((trdr, delivery), []).append(
+                (mtrl, int(first_qty[trdr]), conf, start, end, int(total)))
 
     out = []
     for (trdr, delivery), entries in sorted(by_customer.items()):
-        lines = [ctx.line(m, q, None, conf) for m, q, conf, _, _ in entries]
-        facts = {"lines": [{"name": str(ctx.items.at[m, "NAME"]), "qty": q, "last_year_qty": q,
+        lines = [ctx.line(m, q, None, conf) for m, q, conf, _, _, _ in entries]
+        facts = {"lines": [{"name": str(ctx.items.at[m, "NAME"]), "qty": q, "last_year_total": t,
                             "unit": UNITS.get(ctx.items.at[m, "MTRUNIT1"], ""),
                             "window_start": s.strftime("%Y-%m-%d"),
                             "window_end": e.strftime("%Y-%m-%d")}
-                           for m, q, _, s, e in entries]}
+                           for m, q, _, s, e, t in entries]}
         flags = [] if delivery.weekday() in ctx.route(trdr) else [EXTRA_ROUTE]
         out.append(ctx.suggestion(OFFER, trdr, delivery, lines, flags, facts, None, text_writer))
     return out
@@ -441,10 +536,21 @@ def offer_suggestions(ctx, skip, text_writer=None):
 # --- all together ----------------------------------------------------------
 
 def _rank(suggestions):
-    """PRIORITY 1, 2, ...: urgent first, then the earliest depletion, then the value in €."""
+    """PRIORITY 1, 2, ...:
+    1. urgent orders (earliest depletion, then value)
+    2. loss risks (customer's purchases of the last 12 months, highest first)
+    3. other orders (earliest depletion, then value)
+    4. offers (value)
+    """
     def key(s):
         dep = pd.Timestamp(s["EARLIEST_DEPLETION"]) if s["EARLIEST_DEPLETION"] else pd.Timestamp.max
-        return (URGENT not in s["FLAGS"], dep, -s["VALUE_EUR"], s["TRDR"])
+        if URGENT in s["FLAGS"]:
+            return (0, dep, -s["VALUE_EUR"], s["TRDR"])
+        if s["ACTION_TYPE"] == LOSS:
+            return (1, -s["FACTS"]["purchases_12m_eur"], s["TRDR"])
+        if s["ACTION_TYPE"] == ORDER:
+            return (2, dep, -s["VALUE_EUR"], s["TRDR"])
+        return (3, -s["VALUE_EUR"], s["TRDR"])
     ordered = sorted(suggestions, key=key)
     for i, s in enumerate(ordered, start=1):
         s["PRIORITY"] = i
