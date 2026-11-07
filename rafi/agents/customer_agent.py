@@ -71,7 +71,7 @@ def forecast_details(data, today=TODAY, details_path=DETAILS_PATH, method=DEFAUL
     details = compute_details(data, cutoff, method)
     if cutoff == DETAILS_CUTOFF and method == DEFAULT_METHOD:
         path.parent.mkdir(parents=True, exist_ok=True)
-        details.to_csv(path, index=False, date_format="%Y-%m-%d")
+        details.to_csv(path, index=False, date_format="%Y-%m-%d", encoding="utf-8")
     return details, "υπολογισμός"
 
 

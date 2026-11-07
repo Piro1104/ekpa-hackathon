@@ -1,5 +1,6 @@
 """Streamlit pieces shared by the pages: look, reference data, cards, tiles, chat."""
 import html
+import os
 import re
 import subprocess
 import sys
@@ -312,7 +313,8 @@ def empty_state(suggestions):
     if st.button("Υπολογισμός προτάσεων τώρα", type="primary"):
         with st.spinner("Υπολογίζονται οι προτάσεις της ημέρας. Χρειάζεται περίπου ένα λεπτό..."):
             done = subprocess.run([sys.executable, str(ROOT / "scripts" / "daily_run.py")],
-                                  cwd=ROOT, capture_output=True, text=True)
+                                  cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         if done.returncode == 0:
             st.rerun()
         st.error("Ο υπολογισμός δεν ολοκληρώθηκε. Τρέξε python scripts/daily_run.py "

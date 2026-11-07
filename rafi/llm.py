@@ -541,7 +541,7 @@ def _demo():
     rows = _load_suggestions(3)
     if rows is None:
         print(f"Δεν βρέθηκε {_db_path()}· χρησιμοποιώ το data/sample_suggested_order.json.")
-        sample = json.loads((ROOT / "data" / "sample_suggested_order.json").read_text("utf-8"))
+        sample = json.loads((ROOT / "data" / "sample_suggested_order.json").read_text(encoding="utf-8"))
         sample.setdefault("SALES_NOTE", f"{HELLO} Σας προτείνουμε παράδοση "
                                         f"{_dm(sample['SUGGESTED_DELIVERY_DATE'])}.")
         rows = [{"id": "δείγμα", "payload": sample}]

@@ -1,5 +1,6 @@
 """Shared fixtures."""
 import socket
+import os
 import subprocess
 import sys
 import time
@@ -22,7 +23,8 @@ def erp_url():
     """The organisers' mock ERP server, started on a free port for the tests."""
     port = _free_port()
     proc = subprocess.Popen([sys.executable, str(ROOT / "mock_erp_server.py"), "--port", str(port)],
-                            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     url = f"http://127.0.0.1:{port}"
     try:
         deadline = time.time() + 30

@@ -47,5 +47,5 @@ def test_tables_keep_real_values_and_show_greek():
 
 
 def test_requirements_ask_for_streamlit_1_67():
-    lines = (ROOT / "requirements.txt").read_text().splitlines()
+    lines = (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
     assert "streamlit>=1.67" in lines

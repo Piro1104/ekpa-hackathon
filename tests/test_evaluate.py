@@ -190,7 +190,7 @@ def test_make_submission_writes_1975_rows_in_template_format(tmp_path):
     out = tmp_path / "team_rafi.csv"
     script.main(out)
 
-    sub = pd.read_csv(out, dtype=str, keep_default_na=False)
+    sub = pd.read_csv(out, encoding="utf-8", dtype=str, keep_default_na=False)
     template = pd.read_csv(DATA / "submission_template.csv", encoding="utf-8-sig",
                            dtype=str, keep_default_na=False)
     assert len(sub) == 1975

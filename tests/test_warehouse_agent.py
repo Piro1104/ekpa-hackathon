@@ -57,7 +57,7 @@ def test_settings_defaults_when_file_missing(tmp_path):
 
 def test_settings_read_from_file(tmp_path):
     p = tmp_path / "settings.json"
-    p.write_text(json.dumps({"stock_cover_weeks": 6, "safety_weeks": 2, "other": 1}))
+    p.write_text(json.dumps({"stock_cover_weeks": 6, "safety_weeks": 2, "other": 1}), encoding="utf-8")
     assert w.load_settings(p) == {"stock_cover_weeks": 6, "safety_weeks": 2}
 
 
@@ -77,7 +77,7 @@ def test_suppliers_one_per_goods_category():
 def test_suppliers_missing_category_is_an_error(tmp_path):
     p = tmp_path / "s.csv"
     p.write_text("SUPPLIER_ID,NAME,MTRCATEGORY,LEAD_TIME_DAYS,MIN_ORDER_QTY,CONTACT\n"
-                 "S1,Α,Νερά,3,10,\n")
+                 "S1,Α,Νερά,3,10,\n", encoding="utf-8")
     with pytest.raises(ValueError):
         w.load_suppliers(items_df(), p)
 
@@ -106,7 +106,7 @@ def test_estimated_stock_follows_cover_weeks():
 def test_stock_file_wins_and_missing_items_keep_the_estimate(tmp_path):
     d = deliv([("2025-11-02", 1, 5001, 10), ("2025-11-02", 1, 5002, 8)])
     p = tmp_path / "stock.csv"
-    p.write_text("MTRL,QTY\n5001,250\n")
+    p.write_text("MTRL,QTY\n5001,250\n", encoding="utf-8")
     s = w.current_stock(d, items_df(), TODAY, 4, p).set_index("MTRL")
     assert s.at[5001, "QTY"] == 250 and s.at[5001, "STOCK_SOURCE"] == w.FILE
     assert s.at[5002, "QTY"] == 8 and s.at[5002, "STOCK_SOURCE"] == w.ESTIMATE
@@ -412,7 +412,7 @@ def test_full_run_saves_once_and_cli_works(tmp_path, monkeypatch, capsys):
     det = details_df([(1001, 5003, "2026-11-06", 3, "ΚΑΝΟΝΙΚΗ"),
                       (1001, 5013, "2026-11-19", 5, "ΚΑΝΟΝΙΚΗ")])
     det_path = tmp_path / "details.csv"
-    det.to_csv(det_path, index=False, date_format="%Y-%m-%d")
+    det.to_csv(det_path, index=False, date_format="%Y-%m-%d", encoding="utf-8")
     db = tmp_path / "t.db"
     kw = dict(db=db, details_path=det_path, settings_path=tmp_path / "no.json",
               stock_path=tmp_path / "no.csv")

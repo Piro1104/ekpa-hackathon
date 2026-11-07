@@ -67,7 +67,7 @@ def test_reject_needs_a_reason_and_is_final(db, tmp_path):
 def test_failed_file_write_keeps_the_proposal(db, tmp_path):
     pid = store.save_purchase_new([order()], db=db)["saved"][0]
     blocker = tmp_path / "po"
-    blocker.write_text("not a directory")
+    blocker.write_text("not a directory", encoding="utf-8")
     with pytest.raises(OSError):
         store.approve_purchase(pid, "αποθήκη", db=db, out_dir=blocker)
     assert store.list_purchase_suggestions(db=db)[0]["status"] == store.PROPOSED
