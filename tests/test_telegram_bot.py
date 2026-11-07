@@ -160,12 +160,90 @@ def test_brief_with_orchestrator_and_warehouse(db, monkeypatch):
     msgs = tb.brief_messages(path)
     assert len(msgs) == 4
     assert "Προς έγκριση: 9" in msgs[0][0] and "Αξία σε κίνδυνο: 1.234,50 €" in msgs[0][0]
-    assert "Ελλείψεις: 1" in msgs[0][0]
+    assert "Ελλείψεις (δεν καλύπτονται πελάτες): 1" in msgs[0][0]
+    assert "Αργήσαμε (πελάτες καλυμμένοι): 0" in msgs[0][0]  # no late_count: counted
     assert "(1)" in msgs[1][0]
     text, kb = msgs[3]
     assert "Προμηθευτής Νερών Α.Ε.: έως Τρ. 03/11/2026 · 500,00 € · έλλειψη" in text
     assert "Αναψυκτικά" not in text  # outside the 7 days
     assert kb[0][0]["callback_data"] == "p:SUP01:2026-11-03"
+
+
+def _real_warehouse(path):
+    """Purchase suggestions as the warehouse agent saves them: one ΕΛΛΕΙΨΗ with 2 of its 3
+    customer deliveries not covered, one ΑΡΓΗΣΑΜΕ with 11 covered, one normal order."""
+    from rafi.agents import warehouse_agent as wa
+
+    def row(mtrl, sup, flag="", affected=(), name="Είδος"):
+        return {"MTRL": mtrl, "SUPPLIER_ID": sup, "SUPPLIER_NAME": f"Προμηθευτής {sup} Α.Ε.",
+                "ORDER_BY": "2026-11-02", "ARRIVAL": "2026-11-09", "QTY": 36,
+                "VALUE_EUR": 460.8, "FLAG": flag, "ITEM_NAME": name, "UNIT": "τεμ.",
+                "STOCK_NOW": 3, "STOCKOUT_DATE": "2026-11-05", "BREACH_DATE": "2026-11-03",
+                "SAFETY_STOCK": 17, "AFFECTED": list(affected), "REASON": f"Λόγος {name}."}
+
+    def a(trdr, missing):
+        return {"TRDR": trdr, "MTRL": 5075, "DELIVERY_DATE": "2026-11-04", "QTY": 2.0,
+                "SUGGESTION_ID": None, "MISSING": missing}
+    store.save_purchase_new([
+        row(5075, "S07", wa.SHORT, [a(1036, 0.0), a(1123, 2.0), a(1010, 1.0)], "Λαμπρυντικό"),
+        row(5076, "S08", wa.LATE, [a(1000 + i, 0.0) for i in range(11)], "Μαλακτικό"),
+        row(5059, "S05", name="Χαρτί υγείας")], db=path)
+
+
+def test_brief_with_the_real_orchestrator_summary(db, monkeypatch):
+    path, _ = db
+    _real_warehouse(path)
+    monkeypatch.delitem(sys.modules, "rafi.agents.orchestrator")  # the real module
+    from rafi.agents import orchestrator
+    summary = orchestrator.morning_summary(db=path)
+    w = summary["warehouse"]
+    assert set(summary["customers"]) == {"counts", "value_at_risk_eur", "offers_value_eur",
+                                         "needs_you"}
+    assert set(w) >= {"orders_count", "short_count", "orders"}
+    assert set(w["orders"][0]) >= {"supplier_id", "supplier_name", "order_by", "arrival",
+                                   "status", "short", "total_value_eur", "reason", "note",
+                                   "lines", "affected_deliveries"}
+    groups = tb.supplier_orders(w)
+    assert [(g["supplier_id"], g["status"], g["uncovered"]) for g in groups] == \
+        [("S07", "ΕΛΛΕΙΨΗ", 2), ("S08", "ΑΡΓΗΣΑΜΕ", 0), ("S05", "", 0)]
+    assert groups[0]["value_eur"] == 460.8 and groups[0]["arrival"] == "2026-11-09"
+    assert groups[1]["before_arrival"] == 11 and groups[0]["note"]
+
+    msgs = tb.brief_messages(path)
+    assert "Ελλείψεις (δεν καλύπτονται πελάτες): 1" in msgs[0][0]
+    assert "Αργήσαμε (πελάτες καλυμμένοι): 1" in msgs[0][0]
+    text = msgs[3][0]
+    assert "Προμηθευτής S07 Α.Ε.: έως Δευτ. 02/11/2026 · 460,80 € · έλλειψη, επηρεάζονται 2 " \
+           "παραδόσεις σε πελάτες" in text
+    assert "Προμηθευτής S08 Α.Ε.: έως Δευτ. 02/11/2026 · 460,80 € · αργήσαμε (οι πελάτες " \
+           "καλύπτονται)" in text
+    assert "Προμηθευτής S05 Α.Ε.: έως Δευτ. 02/11/2026 · 460,80 €\n" in text + "\n"
+
+
+def test_open_purchase_shows_status_and_note(db):
+    path, _ = db
+    _real_warehouse(path)
+    api = FakeApi()
+    bot = tb.Bot(api, CFG, path)
+    press(bot, "p:S07:2026-11-02")
+    text = api.texts()[-1]
+    assert "Έλλειψη: επηρεάζονται 2 παραδόσεις σε πελάτες" in text
+    assert "Μπαρ Πέτρα" in text and "Mini Market Ήλιος" not in text  # covered: not listed
+    assert "Μήνυμα προς τον προμηθευτή" in text and "36 τεμ. «Λαμπρυντικό»" in text
+    press(bot, "p:S08:2026-11-02")
+    text = api.texts()[-1]
+    assert "Αργήσαμε." in text and "Οι 11 παραδόσεις σε πελάτες" in text
+    assert "επηρεάζ" not in text.lower()
+
+
+def test_supplier_orders_old_shape_and_status():
+    old = {"orders": [{"supplier_id": "S1", "order_by": "2026-11-02", "value_eur": 5,
+                       "flag": "ΔΕΝ_ΦΤΑΝΕΙ"},
+                      {"supplier_id": "S2", "order_by": "2026-11-02", "short": False,
+                       "lines": [{"flags": ["ΑΡΓΗΣΑΜΕ"]}]}]}
+    assert [(g["supplier_id"], g["status"]) for g in tb.supplier_orders(old)] == \
+        [("S1", "ΕΛΛΕΙΨΗ"), ("S2", "ΑΡΓΗΣΑΜΕ")]
+    assert tb.supplier_orders(None) == []
 
 
 def test_send_brief_goes_to_the_admin_only(db):
@@ -404,14 +482,16 @@ def test_purchase_uses_the_warehouse_functions_when_present(db, monkeypatch):
     calls = []
     import rafi.agents.warehouse_agent as wa
     monkeypatch.setattr(wa, "approve_purchase_order",
-                        lambda s, o, u: calls.append(("ok", s, o, u)), raising=False)
+                        lambda s, o, u, db=None: calls.append(("ok", s, o, u, db)), raising=False)
     monkeypatch.setattr(wa, "reject_purchase_order",
-                        lambda s, o, r, u: calls.append(("no", s, o, r, u)), raising=False)
+                        lambda s, o, r, u, db=None: calls.append(("no", s, o, r, u, db)),
+                        raising=False)
+    purchases(path)
     bot = tb.Bot(FakeApi(), CFG, path)
     press(bot, "pa:SUP01:2026-11-03")
     press(bot, "prr:SUP01:2026-11-03:0")
-    assert calls == [("ok", "SUP01", "2026-11-03", "telegram"),
-                     ("no", "SUP01", "2026-11-03", "Υπάρχει ακόμα απόθεμα", "telegram")]
+    assert calls == [("ok", "SUP01", "2026-11-03", "telegram", path),
+                     ("no", "SUP01", "2026-11-03", "Υπάρχει ακόμα απόθεμα", "telegram", path)]
 
 
 def test_purchase_reject_fallback_with_other_reason(db):
