@@ -17,6 +17,7 @@ DEFAULTS = {
     "after_approval_mode": DRAFT_ONLY,
     "stock_cover_weeks": 4,
     "safety_weeks": 1,
+    "ai_texts_top_n": 20,  # AI texts for "needs you" + this many more suggestions
 }
 
 
@@ -57,3 +58,12 @@ def extra_route_cost_eur(path=None):
     except (TypeError, ValueError):
         return float(DEFAULTS["extra_route_cost_eur"])
     return value if value >= 0 else float(DEFAULTS["extra_route_cost_eur"])
+
+
+def ai_texts_top_n(path=None):
+    """How many suggestions outside "needs you" get AI texts (20 if missing or not a number)."""
+    try:
+        value = int(load_settings(path).get("ai_texts_top_n"))
+    except (TypeError, ValueError):
+        return DEFAULTS["ai_texts_top_n"]
+    return max(value, 0)

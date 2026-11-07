@@ -178,6 +178,7 @@ def test_daily_run_twice_no_duplicates_and_no_post(db, monkeypatch):
         raise AssertionError("POST to the ERP without approval")
     monkeypatch.setattr(erp_client, "post_draft", no_post)
     monkeypatch.setattr(requests, "post", no_post)
+    monkeypatch.setenv("LLM_MODE", "mock")  # never wait for a real model in the tests
 
     first, customers, salesmen = daily_run.run(db=db)
     assert len(first["saved"]) > 50

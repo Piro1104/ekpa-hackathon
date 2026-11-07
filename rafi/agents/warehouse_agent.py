@@ -471,16 +471,20 @@ def _qty(x):
     return f"{x:,.0f}".replace(",", ".")
 
 
+def _reason_head(o):
+    """First sentence of the REASON: when the item runs out (or under the safety stock)."""
+    if o.get("STOCKOUT_DATE") is not None and pd.notna(o["STOCKOUT_DATE"]):
+        return (f"Το «{o['ITEM_NAME']}» τελειώνει περίπου {_dm(o['STOCKOUT_DATE'])} "
+                f"με τη ζήτηση που προβλέπουμε.")
+    return (f"Το «{o['ITEM_NAME']}» πέφτει κάτω από το απόθεμα ασφαλείας "
+            f"({_qty(o['SAFETY_STOCK'])} {o['UNIT']}) περίπου {_dm(o['BREACH_DATE'])} "
+            f"με τη ζήτηση που προβλέπουμε.")
+
+
 def reason_text(o):
     """REASON from a template, with the numbers of the order `o`."""
     unit = o["UNIT"]
-    if o.get("STOCKOUT_DATE") is not None and pd.notna(o["STOCKOUT_DATE"]):
-        head = (f"Το «{o['ITEM_NAME']}» τελειώνει περίπου {_dm(o['STOCKOUT_DATE'])} "
-                f"με τη ζήτηση που προβλέπουμε.")
-    else:
-        head = (f"Το «{o['ITEM_NAME']}» πέφτει κάτω από το απόθεμα ασφαλείας "
-                f"({_qty(o['SAFETY_STOCK'])} {unit}) περίπου {_dm(o['BREACH_DATE'])} "
-                f"με τη ζήτηση που προβλέπουμε.")
+    head = _reason_head(o)
     lead = f" Ο προμηθευτής θέλει {o['LEAD_TIME_DAYS']} εργάσιμες· "
     if o["FLAG"] == TOO_LATE:
         n = len(o["AFFECTED"])
@@ -603,6 +607,161 @@ def run(today=TODAY, db=None, data_dir=DATA_DIR, details_path=DETAILS_PATH,
                          incoming_from_store(db, today))
     result = store.save_purchase_new(to_records(orders), user="warehouse_agent", db=db)
     return orders, result, stock
+
+
+# --- purchase orders per supplier (dashboard, Telegram, orchestrator) --------
+
+_CUSTOMER_NAMES = {}
+
+
+def customer_names(data_dir=DATA_DIR):
+    """{TRDR: NAME} from TRDR.csv (read once)."""
+    key = str(data_dir)
+    if key not in _CUSTOMER_NAMES:
+        c = pd.read_csv(Path(data_dir) / "TRDR.csv", encoding="utf-8-sig")
+        _CUSTOMER_NAMES[key] = dict(zip(c["TRDR"].astype(int), c["NAME"].astype(str)))
+    return _CUSTOMER_NAMES[key]
+
+
+def _items_text(n):
+    return "1 είδος" if n == 1 else f"{n} είδη"
+
+
+def group_reason(supplier_name, order_by, arrival, rows):
+    """One REASON for a supplier's order (all its lines with the same ORDER_BY)."""
+    if len(rows) == 1:
+        return rows[0]["payload"]["REASON"]
+    text = (f"Από τον προμηθευτή «{supplier_name}» χρειάζονται {_items_text(len(rows))} με "
+            f"παραγγελία έως {_dm(order_by)}, ώστε να φτάσουν {_dm(arrival)}. "
+            + " ".join(_reason_head(r["payload"]) for r in rows))
+    short = [r for r in rows if r["flag"] == TOO_LATE]
+    if short:
+        n = sum(len(r["payload"].get("AFFECTED") or []) for r in short)
+        which = ", ".join(f"«{r['payload']['ITEM_NAME']}»" for r in short)
+        text += (f" Δεν φτάνουν εγκαίρως {'το' if len(short) == 1 else 'τα'} {which}, και "
+                 f"πριν την άφιξη επηρεάζονται {n} παραδόσεις σε πελάτες.")
+    return text
+
+
+def supplier_payload(group):
+    """The input of rafi.llm.write_texts(kind="supplier") for an order of open_purchase_orders."""
+    return {"SUPPLIER_ID": group["supplier_id"], "SUPPLIER_NAME": group["supplier_name"],
+            "ORDER_BY": group["order_by"], "NEEDED_BY": group["arrival"],
+            "LINES": [{"ITEM_NAME": l["item_name"], "QTY1": l["qty"], "UNIT": l["unit"]}
+                      for l in group["lines"]],
+            "REASON": group["reason"]}
+
+
+def _groups(rows):
+    """{(supplier_id, order_by): [rows]} keeping the store's order."""
+    out = {}
+    for r in rows:
+        out.setdefault((r["supplier_id"], r["order_by"]), []).append(r)
+    return out
+
+
+def open_purchase_orders(days: int = 7, db=None, today=None) -> list[dict]:
+    """Purchase suggestions still ΠΡΟΤΑΣΗ with ORDER_BY up to today + `days`, one dict per
+    supplier and ORDER_BY, earliest first.
+
+    Keys: supplier_id, supplier_name, order_by, arrival, short (a line is ΔΕΝ_ΦΤΑΝΕΙ),
+    total_value_eur (list price), reason, note (message to the supplier), note_source,
+    lines [purchase_id, mtrl, item_name, qty, unit, value_eur, flags],
+    affected_deliveries [trdr, customer_name, date, qty, suggestion_id, mtrl, item_name].
+    The note is the one written by the last run (AI or template) while it still covers
+    exactly the same lines, else the template.
+    """
+    from rafi import llm
+
+    today = pd.Timestamp(today if today is not None else TODAY)
+    last = (today + pd.Timedelta(days=int(days))).strftime("%Y-%m-%d")
+    rows = [r for r in store.list_purchase_suggestions(status=store.PROPOSED, db=db)
+            if r["order_by"] <= last]
+    names = customer_names()
+    out = []
+    for (supplier_id, order_by), g in _groups(rows).items():
+        first = g[0]["payload"]
+        arrival = max(r["arrival"] for r in g)
+        lines, affected = [], []
+        for r in g:
+            p = r["payload"]
+            lines.append({"purchase_id": r["id"], "mtrl": int(r["mtrl"]),
+                          "item_name": p.get("ITEM_NAME"), "qty": int(r["qty"]),
+                          "unit": p.get("UNIT"), "value_eur": r["value_eur"],
+                          "flags": [r["flag"]] if r["flag"] else []})
+            for a in p.get("AFFECTED") or []:
+                affected.append({"trdr": int(a["TRDR"]),
+                                 "customer_name": names.get(int(a["TRDR"]), ""),
+                                 "date": a["DELIVERY_DATE"], "qty": a["QTY"],
+                                 "suggestion_id": a.get("SUGGESTION_ID"),
+                                 "mtrl": int(r["mtrl"]), "item_name": p.get("ITEM_NAME")})
+        group = {"supplier_id": supplier_id, "supplier_name": first.get("SUPPLIER_NAME"),
+                 "order_by": order_by, "arrival": arrival,
+                 "short": any(r["flag"] == TOO_LATE for r in g),
+                 "total_value_eur": round(sum(r["value_eur"] or 0.0 for r in g), 2),
+                 "reason": group_reason(first.get("SUPPLIER_NAME"), order_by, arrival, g),
+                 "lines": lines, "affected_deliveries": affected}
+        ids = sorted(r["id"] for r in g)
+        stored = [r["payload"] for r in g if r["payload"].get("GROUP_IDS") == ids]
+        if len(stored) == len(g) and stored[0].get("GROUP_NOTE"):
+            group["note"] = stored[0]["GROUP_NOTE"]
+            group["note_source"] = stored[0].get("GROUP_NOTE_SOURCE", llm.TEMPLATE)
+        else:
+            group["note"] = llm.template_for(supplier_payload(group), "supplier")["note"]
+            group["note_source"] = llm.TEMPLATE
+        out.append(group)
+    return sorted(out, key=lambda o: (o["order_by"], not o["short"], -o["total_value_eur"]))
+
+
+def _group_rows(supplier_id, order_by, db):
+    rows = [r for r in store.list_purchase_suggestions(status=store.PROPOSED, db=db)
+            if r["supplier_id"] == str(supplier_id) and r["order_by"] == str(order_by)]
+    if not rows:
+        raise store.StoreError(f"Δεν υπάρχει παραγγελία σε {store.PROPOSED} για τον προμηθευτή "
+                               f"{supplier_id} με ημερομηνία {order_by}.")
+    return rows
+
+
+def approve_purchase_order(supplier_id, order_by, user, db=None, out_dir=None):
+    """Approve every line of the supplier's order (store.approve_purchase). Returns the files."""
+    return [store.approve_purchase(r["id"], user, db=db, out_dir=out_dir)
+            for r in _group_rows(supplier_id, order_by, db)]
+
+
+def reject_purchase_order(supplier_id, order_by, reason, user, db=None):
+    """Reject every line of the supplier's order with the same reason. Returns the ids."""
+    if not reason or not str(reason).strip():
+        raise store.StoreError("Η απόρριψη χρειάζεται λόγο.")
+    rows = _group_rows(supplier_id, order_by, db)
+    for r in rows:
+        store.reject_purchase(r["id"], reason, user, db=db)
+    return [r["id"] for r in rows]
+
+
+def write_group_notes(days=7, db=None, ai=True, today=None):
+    """Write the supplier note of every order in the next `days` days and keep it in the store.
+
+    With `ai` and a model that answers: rafi.llm.write_texts(kind="supplier"), which falls back
+    to the template by itself. A note already written by AI for the same lines is kept.
+    Returns {"orders", "ai"}.
+    """
+    from rafi import llm
+
+    groups = open_purchase_orders(days, db, today)
+    use_ai = ai and bool(groups) and llm.available()
+    n_ai = 0
+    for g in groups:
+        if g["note_source"] == llm.AI:
+            n_ai += 1
+            continue
+        texts = (llm.write_texts(supplier_payload(g), kind="supplier") if use_ai
+                 else {"note": g["note"], "source": llm.TEMPLATE})
+        n_ai += texts["source"] == llm.AI
+        store.set_purchase_fields([l["purchase_id"] for l in g["lines"]],
+                                  {"GROUP_NOTE": texts["note"], "GROUP_NOTE_SOURCE": texts["source"],
+                                   "GROUP_IDS": sorted(l["purchase_id"] for l in g["lines"])},
+                                  db=db)
+    return {"orders": len(groups), "ai": n_ai}
 
 
 # --- CLI --------------------------------------------------------------------

@@ -220,6 +220,9 @@ def test_1127_is_a_loss_risk(suggestions, data):
     assert d >= pd.Timestamp(s["FACTS"]["usual_reopen"])
     assert working_day(d) and d.weekday() in data["routes"][1127] and not s["FLAGS"]
     assert "κλειστό για τη σεζόν" in s["payload"]["REASON"]
+    assert s["payload"]["REASON"].startswith(
+        "Κλείνει κάθε χειμώνα γύρω στις 28/10, αλλά φέτος η τελευταία παράδοση ήταν 17/8, "
+        "72 ημέρες νωρίτερα.")
     assert "πώς πήγε η σεζόν" in s["payload"]["SALES_NOTE"]
     for fl, line in zip(s["FACTS"]["lines"], s["payload"]["LINES"]):
         assert line["QTY1"] == max(1, math.ceil(fl["median_qty"] * fl["season_scale"] - 1e-9))
@@ -292,3 +295,23 @@ def test_text_writer_hook(data):
     kept = build_suggestions(*args, text_writer=broken)
     assert all(s["payload"]["TEXT_SOURCE"] == "ΠΡΟΤΥΠΟ" for s in kept)
     assert all(s["payload"]["REASON"] != "AI κείμενο" for s in kept)
+
+
+def test_reasons_are_sentences_not_fragments(suggestions):
+    for s in suggestions:
+        reason = s["payload"]["REASON"]
+        assert "· " not in reason and reason.endswith(".")
+        assert " 1 είδη" not in reason
+
+
+def test_loss_text_for_a_customer_that_does_not_close():
+    from rafi.suggestions import template_texts
+    facts = {"action_type": LOSS, "delivery_date": "2026-11-04", "last_delivery": "2026-08-19",
+             "median_interval": 7.0, "days_silent": 74, "usual_close": None, "days_early": None,
+             "closed_now": False, "usual_reopen": None, "purchases_12m_eur": 17268.0,
+             "lines": [{"name": "Νερό", "qty": 2, "unit": "κιβ."}]}
+    reason = template_texts(facts)["REASON"]
+    assert reason == ("Ο πελάτης παρήγγελνε κάθε ~7 ημέρες, αλλά έχει να πάρει παράδοση από "
+                      "τις 19/8, δηλαδή 74 ημέρες. Τους τελευταίους 12 μήνες αγόρασε 17.268 €. "
+                      "Προτείνουμε τηλεφώνημα και το συνηθισμένο καλάθι του (1 είδος, σε "
+                      "ποσότητες για την εποχή) με παράδοση Τετάρτη 4/11.")
