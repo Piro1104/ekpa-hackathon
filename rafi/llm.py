@@ -128,6 +128,28 @@ def chat(system, user, want_json=False, cfg=None):
         raise LLMError(f"{type(e).__name__}: {e}") from e
 
 
+def available(timeout=3, cfg=None):
+    """Quick check before a batch of calls: is the model of LLM_MODE there at all?
+
+    mock: always; cloud: an API key is set; local: Ollama answers on /api/tags.
+    If not, the callers keep the templates instead of waiting LLM_TIMEOUT per text.
+    """
+    cfg = cfg or settings()
+    mode = cfg["LLM_MODE"]
+    if mode == "mock":
+        return True
+    if mode == "cloud":
+        return bool(cfg["ANTHROPIC_API_KEY"])
+    if mode == "local":
+        try:
+            requests.get(cfg["OLLAMA_URL"].rstrip("/") + "/api/tags",
+                         timeout=timeout).raise_for_status()
+            return True
+        except requests.RequestException:
+            return False
+    return False
+
+
 def parse_json(text):
     """The first JSON object in the reply (models sometimes wrap it in ``` or prose)."""
     if not isinstance(text, str):
