@@ -45,6 +45,12 @@ LABELS = {
     "ΑΠΟΡΡΙΨΗ": "Απόρριψη",
     "ΑΠΟΣΤΟΛΗ": "Αποστολή στο ERP",
     "ΣΦΑΛΜΑ_ΑΠΟΣΤΟΛΗΣ": "Σφάλμα αποστολής",
+    "ΜΗΝΥΜΑ_ΠΕΛΑΤΗ": "Μήνυμα στον πελάτη",
+    "ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ": "Μήνυμα στον προμηθευτή",
+    # purchase flags (warehouse agent)
+    "ΑΡΓΗΣΑΜΕ": "Αργήσαμε",
+    "ΕΛΛΕΙΨΗ": "Έλλειψη",
+    "ΔΕΝ_ΦΤΑΝΕΙ": "Έλλειψη",
 }
 
 TAB_NEEDS_YOU, TAB_ORDERS, TAB_OFFERS = "Χρειάζονται εσένα", "Παραγγελίες", "Προσφορές"
@@ -363,8 +369,15 @@ def history_details(h, items_map=None):
     return str(d)
 
 
+KIND_CUSTOMERS, KIND_WAREHOUSE, KIND_ALL = "Πελάτες", "Αποθήκη", "Όλα"
+HISTORY_KINDS = [KIND_ALL, KIND_CUSTOMERS, KIND_WAREHOUSE]
+
+
 def history_rows(entries, customers_map=None, items_map=None, salesmen=None):
-    """Rows for the history table, newest first."""
+    """Rows for the history table, newest first.
+
+    Hidden columns (start with "_"): _trdr, _key (who, for the filter), _kind (Πελάτες).
+    """
     customers_map = customers_map or {}
     rows = []
     for h in sorted(entries, key=lambda h: h["id"], reverse=True):
@@ -372,8 +385,69 @@ def history_rows(entries, customers_map=None, items_map=None, salesmen=None):
         rows.append({"Ημερομηνία": pd.Timestamp(h["at"]), "Πελάτης": name, "Κωδικός": code,
                      "Τύπος": label(h["action_type"]), "Κίνηση": label(h["action"]),
                      "Λεπτομέρειες": history_details(h, items_map),
-                     "Χρήστης": user_label(h["user"], salesmen), "_trdr": int(h["trdr"])})
+                     "Χρήστης": user_label(h["user"], salesmen), "_trdr": int(h["trdr"]),
+                     "_key": f"c:{int(h['trdr'])}", "_kind": KIND_CUSTOMERS})
     return rows
+
+
+def purchase_history_details(e, purchase=None):
+    """Details of one purchase history entry: the item and quantity, then what happened."""
+    d = e.get("details") or {}
+    p = (purchase or {}).get("payload") or {}
+    item = ""
+    if purchase:
+        item = (f"{p.get('ITEM_NAME') or purchase.get('mtrl')}: "
+                f"{fmt_qty(purchase.get('qty'))} {p.get('UNIT') or ''}").rstrip()
+    action = e.get("action")
+    if action == "ΔΗΜΙΟΥΡΓΙΑ":
+        more = f"παραγγελία έως {dm(d['order_by'])}" if d.get("order_by") else ""
+        if d.get("flag"):
+            more += f" · {label(d['flag'])}"
+    elif action == "ΕΓΚΡΙΣΗ":
+        more = "γράφτηκε η εντολή αγοράς"
+    elif action == "ΑΠΟΡΡΙΨΗ":
+        more = f"Λόγος: {d.get('reason', '')}"
+    elif action == "ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ":
+        more = f"μήνυμα μέσω {d.get('Κανάλι') or 'Telegram'}"
+    else:
+        more = " · ".join(f"{label(k)}: {v}" for k, v in d.items() if v not in (None, "", []))
+    return " · ".join(x for x in (item, more) if x)
+
+
+def purchase_history_rows(entries, purchases=(), salesmen=None):
+    """Rows of the purchase history (warehouse) in the same columns as history_rows, with
+    type «Αποθήκη» and the supplier in the place of the customer. Newest first."""
+    by_id = {p["id"]: p for p in purchases or []}
+    rows = []
+    for e in sorted(entries, key=lambda e: e["id"], reverse=True):
+        p = by_id.get(e["purchase_id"])
+        sup = str(p["supplier_id"]) if p else ""
+        name = ((p or {}).get("payload") or {}).get("SUPPLIER_NAME") or sup or "Προμηθευτής"
+        rows.append({"Ημερομηνία": pd.Timestamp(e["at"]), "Πελάτης": name, "Κωδικός": sup,
+                     "Τύπος": KIND_WAREHOUSE, "Κίνηση": label(e["action"]),
+                     "Λεπτομέρειες": purchase_history_details(e, p),
+                     "Χρήστης": user_label(e["user"], salesmen), "_trdr": None,
+                     "_key": f"s:{sup}", "_kind": KIND_WAREHOUSE})
+    return rows
+
+
+def merge_history(*parts):
+    """All history rows together, newest first (one time order for customers and warehouse)."""
+    rows = [r for part in parts for r in part]
+    return sorted(rows, key=lambda r: r["Ημερομηνία"], reverse=True)
+
+
+def filter_history(rows, kind=KIND_ALL, key=None, actions=()):
+    """Rows of one kind (Πελάτες / Αποθήκη / Όλα), one customer or supplier, some actions."""
+    return [r for r in rows
+            if (kind in (None, KIND_ALL) or r["_kind"] == kind)
+            and (key is None or r["_key"] == key)
+            and (not actions or r["Κίνηση"] in actions)]
+
+
+def visible(row):
+    """The row without its hidden columns."""
+    return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
 # --- assistant ---------------------------------------------------------------
