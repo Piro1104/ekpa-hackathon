@@ -141,12 +141,15 @@ def flag_labels(s):
 
 
 def user_label(user, salesmen=None):
-    """Who did it, in words: 'Σύστημα', 'Διαχειριστής' or the salesman's name."""
+    """Who did it, in words: 'Σύστημα', 'Διαχειριστής', 'Διαχειριστής (Telegram)' or the
+    salesman's name."""
     u = str(user)
     if u == "system":
         return "Σύστημα"
     if u == "admin":
         return "Διαχειριστής"
+    if u == "telegram":
+        return "Διαχειριστής (Telegram)"
     if salesmen is not None and u.isdigit() and int(u) in salesmen:
         return str(salesmen[int(u)])
     return u

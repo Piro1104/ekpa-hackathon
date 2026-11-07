@@ -90,6 +90,7 @@ def test_users():
     assert h.store_user({"salesman": 103}) == "admin"
     assert h.user_label(h.store_user()) == "Διαχειριστής"
     assert h.user_label("system") == "Σύστημα"
+    assert h.user_label("telegram") == "Διαχειριστής (Telegram)"
     assert h.user_label("103", {103: "Ελένη"}) == "Ελένη"
 
 
