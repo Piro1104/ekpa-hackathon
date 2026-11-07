@@ -12,3 +12,5 @@ draft_orders/
 .claude/settings.local.json
 # Generated submissions
 submissions/
+# Approved purchase orders (warehouse agent)
+purchase_orders/
