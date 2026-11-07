@@ -56,7 +56,7 @@ REJECT_REASONS = ["Ο πελάτης έχει ακόμα απόθεμα", "Ο π
 
 AFTER_APPROVAL_OPTIONS = {
     _settings.DRAFT_ONLY: "Μόνο πρόχειρη στο ERP",
-    _settings.DRAFT_AND_MESSAGE: "Πρόχειρη στο ERP και μήνυμα στον πελάτη",
+    _settings.DRAFT_AND_MESSAGE: "Πρόχειρη και μήνυμα σε πελάτη/προμηθευτή",
 }
 
 ASSISTANT_UNAVAILABLE = "Ο βοηθός AI δεν είναι ακόμα διαθέσιμος"
@@ -140,6 +140,9 @@ def flag_labels(s):
     return out
 
 
+SYSTEM_USERS = {"orchestrator": "Σύστημα (συντονιστής)", "warehouse_agent": "Σύστημα (αποθήκη)"}
+
+
 def user_label(user, salesmen=None):
     """Who did it, in words: 'Σύστημα', 'Διαχειριστής', 'Διαχειριστής (Telegram)' or the
     salesman's name."""
@@ -150,6 +153,8 @@ def user_label(user, salesmen=None):
         return "Διαχειριστής"
     if u == "telegram":
         return "Διαχειριστής (Telegram)"
+    if u in SYSTEM_USERS:
+        return SYSTEM_USERS[u]
     if salesmen is not None and u.isdigit() and int(u) in salesmen:
         return str(salesmen[int(u)])
     return u
@@ -611,9 +616,57 @@ def fmt_date_words(d):
     return "—" if t is None else f"{WEEKDAYS[t.weekday()]} {t.day} {MONTHS_GEN[t.month - 1]} {t.year}"
 
 
+def _plural(n, one, many):
+    return f"{fmt_num(n)} {one if n == 1 else many}"
+
+
+def morning_customers_text(c):
+    """One sentence from morning_summary()["customers"] (counts, value_at_risk_eur, ...)."""
+    n = c.get("counts") or {}
+    if n.get("pending") is None:
+        return ""
+    needs = c.get("needs_you")
+    text = f"Περιμένουν έγκριση {_plural(n['pending'], 'πρόταση', 'προτάσεις')}"
+    if isinstance(needs, list):
+        text += f", από τις οποίες {fmt_num(len(needs))} χρειάζονται εσένα"
+    text += "."
+    parts = []
+    if n.get("extra_routes"):
+        parts.append(_plural(n["extra_routes"], "έκτακτο δρομολόγιο", "έκτακτα δρομολόγια"))
+    if n.get("loss_risks"):
+        parts.append(_plural(n["loss_risks"], "κίνδυνος απώλειας", "κίνδυνοι απώλειας"))
+    if parts:
+        text += " " + " και ".join(parts) + "."
+    if c.get("value_at_risk_eur") is not None:
+        text += f" Αξία σε κίνδυνο {fmt_eur(c['value_at_risk_eur'])}."
+    return text
+
+
+def morning_warehouse_text(w):
+    """One sentence from morning_summary()["warehouse"] (orders_count, short_count, ...)."""
+    if w.get("orders_count") is None:
+        return ""
+    n = w["orders_count"]
+    if not n:
+        return "Καμία παραγγελία σε προμηθευτή μέσα στην εβδομάδα."
+    text = f"{_plural(n, 'παραγγελία', 'παραγγελίες')} σε προμηθευτές μέσα στην εβδομάδα"
+    value = sum(float(o.get("total_value_eur") or 0) for o in w.get("orders") or [])
+    if value:
+        text += f", {fmt_eur(value)} σε τιμή καταλόγου"
+    short, late = w.get("short_count") or 0, w.get("late_count") or 0
+    if short:
+        text += f". Ελλείψεις: {fmt_num(short)}, με πελάτες που δεν καλύπτονται"
+    if late:
+        text += f". Αργήσαμε: {fmt_num(late)}, οι πελάτες καλύπτονται"
+    if not short and not late:
+        text += ", όλες στην ώρα τους"
+    return text + "."
+
+
 def morning_texts():
-    """{"customers": text, "warehouse": text} from rafi.agents.orchestrator.morning_summary,
-    keeping only plain texts. {} while the coordinator is not there or fails."""
+    """{"customers": text, "warehouse": text} made from the numbers of
+    rafi.agents.orchestrator.morning_summary. A part without numbers is left out, so the
+    page shows no empty line; {} while the coordinator is not there or fails."""
     import importlib
     try:
         out = importlib.import_module("rafi.agents.orchestrator").morning_summary()
@@ -621,11 +674,12 @@ def morning_texts():
         return {}
     if not isinstance(out, dict):
         return {}
+    makers = {"customers": morning_customers_text, "warehouse": morning_warehouse_text}
     texts = {}
-    for k in ("customers", "warehouse"):
+    for k, make in makers.items():
         v = out.get(k)
         if isinstance(v, dict):
-            v = v.get("text") or v.get("summary")
+            v = v.get("text") or make(v)
         if isinstance(v, str) and v.strip():
             texts[k] = v.strip()
     return texts
@@ -634,6 +688,26 @@ def morning_texts():
 MESSAGE_SENT = "Στάλθηκε και μήνυμα στον πελάτη."
 MESSAGE_NOT_SENT = "Το μήνυμα στον πελάτη δεν στάλθηκε."
 MESSAGE_NOT_READY = "Το μήνυμα στον πελάτη δεν στάλθηκε: η αποστολή μηνυμάτων δεν είναι ακόμα ενεργή."
+
+
+SUPPLIER_SENT = "Στάλθηκε και μήνυμα στον προμηθευτή."
+SUPPLIER_NOT_SENT = "Το μήνυμα στον προμηθευτή δεν στάλθηκε"
+
+
+def notify_supplier_after_approval(supplier_id, order_by, mode):
+    """After a purchase approval: message the supplier when the setting asks for it.
+
+    Returns None when no message is wanted, else (streamlit kind, text) for the page.
+    """
+    if mode != _settings.DRAFT_AND_MESSAGE:
+        return None
+    import importlib
+    try:
+        bot = importlib.import_module("rafi.telegram_bot")
+        ok, why = bot.supplier_notice(supplier_id, str(order_by)[:10])
+    except Exception:
+        return ("warning", SUPPLIER_NOT_SENT + ".")
+    return ("success", SUPPLIER_SENT) if ok else ("warning", f"{SUPPLIER_NOT_SENT}: {why}.")
 
 
 def notify_after_approval(suggestion_id, mode):

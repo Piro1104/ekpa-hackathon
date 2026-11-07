@@ -114,8 +114,11 @@ with right:
             try:
                 funcs["approve_purchase_order"](o["supplier_id"], o["order_by"], h.store_user())
                 ui.clear_warehouse()
-                ui.flash("warehouse", "success",
-                         f"Η παραγγελία προς {supplier} εγκρίθηκε.")
+                done = f"Η παραγγελία προς {supplier} εγκρίθηκε."
+                note = h.notify_supplier_after_approval(
+                    o["supplier_id"], o["order_by"], h.read_settings().get("after_approval_mode"))
+                kind = note[0] if note else "success"
+                ui.flash("warehouse", kind, done + (f" {note[1]}" if note else ""))
                 st.rerun()
             except Exception as e:
                 st.error(h.humanize(e))

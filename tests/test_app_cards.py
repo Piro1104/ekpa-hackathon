@@ -105,7 +105,46 @@ def test_morning_texts(monkeypatch):
     orch = types.ModuleType("rafi.agents.orchestrator")
     orch.morning_summary = lambda db=None: {"customers": "3 επείγοντα", "warehouse": {"n": 2}}
     monkeypatch.setitem(sys.modules, "rafi.agents.orchestrator", orch)
-    assert h.morning_texts() == {"customers": "3 επείγοντα"}
+    assert h.morning_texts() == {"customers": "3 επείγοντα"}  # no numbers: no empty line
+
+
+def test_morning_texts_from_the_summary_numbers(monkeypatch):
+    # the shape rafi.agents.orchestrator.morning_summary really returns
+    summary = {
+        "customers": {"counts": {"pending": 179, "extra_routes": 2, "loss_risks": 5,
+                                 "marginal": 49, "orders": 109, "offers": 65},
+                      "value_at_risk_eur": 42589.2, "offers_value_eur": 26520.0,
+                      "needs_you": [{"suggestion_id": i} for i in range(7)]},
+        "warehouse": {"orders_count": 9, "short_count": 0, "late_count": 1,
+                      "orders": [{"total_value_eur": 14000.0}, {"total_value_eur": 685.3}]}}
+    orch = types.ModuleType("rafi.agents.orchestrator")
+    orch.morning_summary = lambda db=None: summary
+    monkeypatch.setitem(sys.modules, "rafi.agents.orchestrator", orch)
+    t = h.morning_texts()
+    assert t["customers"] == ("Περιμένουν έγκριση 179 προτάσεις, από τις οποίες 7 χρειάζονται "
+                              "εσένα. 2 έκτακτα δρομολόγια και 5 κίνδυνοι απώλειας. "
+                              "Αξία σε κίνδυνο 42.589,20 €.")
+    assert t["warehouse"] == ("9 παραγγελίες σε προμηθευτές μέσα στην εβδομάδα, 14.685,30 € σε "
+                              "τιμή καταλόγου. Αργήσαμε: 1, οι πελάτες καλύπτονται.")
+    summary["warehouse"] = {"orders_count": 0, "short_count": 0, "orders": []}
+    assert h.morning_texts()["warehouse"] == "Καμία παραγγελία σε προμηθευτή μέσα στην εβδομάδα."
+
+
+def test_supplier_message_after_purchase_approval(monkeypatch):
+    assert h.notify_supplier_after_approval("S07", "2026-11-02", "draft_only") is None
+    bot = types.ModuleType("rafi.telegram_bot")
+    bot.supplier_notice = lambda sup, order_by: (True, "")
+    monkeypatch.setitem(sys.modules, "rafi.telegram_bot", bot)
+    assert h.notify_supplier_after_approval("S07", "2026-11-02", "draft_and_message") == \
+        ("success", "Στάλθηκε και μήνυμα στον προμηθευτή.")
+    bot.supplier_notice = lambda sup, order_by: (False, "λείπει το TELEGRAM_SUPPLIER_CHAT_ID στο .env")
+    assert h.notify_supplier_after_approval("S07", "2026-11-02", "draft_and_message") == \
+        ("warning", "Το μήνυμα στον προμηθευτή δεν στάλθηκε: λείπει το "
+                    "TELEGRAM_SUPPLIER_CHAT_ID στο .env.")
+    bot.supplier_notice = lambda sup, order_by: 1 / 0
+    assert h.notify_supplier_after_approval("S07", "2026-11-02", "draft_and_message")[0] == "warning"
+    assert h.AFTER_APPROVAL_OPTIONS["draft_and_message"] == \
+        "Πρόχειρη και μήνυμα σε πελάτη/προμηθευτή"
 
 
 def test_extra_settings(tmp_path):
