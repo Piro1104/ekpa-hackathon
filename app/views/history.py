@@ -5,9 +5,8 @@ from app import helpers as h
 from app import ui
 from rafi import store
 
-st.title("Ιστορικό")
-st.markdown('<p class="ne-sub">Όλες οι κινήσεις: δημιουργία, διορθώσεις, εγκρίσεις, '
-            'απορρίψεις και αποστολές στο ERP</p>', unsafe_allow_html=True)
+ui.page_header("Ιστορικό", "", "Ιστορικό", "Όλες οι κινήσεις: δημιουργία, διορθώσεις, "
+               "εγκρίσεις, απορρίψεις και αποστολές στο ERP")
 
 rows = h.history_rows(store.history(), ui.customers_map(), ui.items_map(), ui.salesmen_map())
 if not rows:

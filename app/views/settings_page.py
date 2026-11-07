@@ -3,7 +3,7 @@ import streamlit as st
 from app import helpers as h
 from app import ui
 
-st.title("Ρυθμίσεις")
+ui.page_header("Ρυθμίσεις", "", "Ρυθμίσεις", "Τι κάνει το Never Empty μετά την έγκριση και πώς υπολογίζει")
 
 values = h.read_settings()
 modes = list(h.AFTER_APPROVAL_OPTIONS)
@@ -19,17 +19,20 @@ with st.form("settings", border=True):
                     index=modes.index(values["after_approval_mode"])
                     if values["after_approval_mode"] in modes else 0,
                     format_func=h.AFTER_APPROVAL_OPTIONS.get)
+    extra = {}
+    for key, (text, step, whole) in h.EXTRA_SETTINGS.items():
+        if key in values:
+            current = values[key]
+            extra[key] = st.number_input(text, min_value=0 if whole else 0.0,
+                                         step=step, value=int(current) if whole else float(current),
+                                         format="%d" if whole else "%.1f")
     saved = st.form_submit_button("Αποθήκευση", type="primary")
 
 if saved:
     try:
-        h.write_settings(cost, mode)
-        ui.flash("settings", "success", "Οι ρυθμίσεις αποθηκεύτηκαν. Το νέο κόστος ισχύει από "
-                                        "τον επόμενο υπολογισμό προτάσεων.")
+        h.write_settings(cost, mode, extra=extra)
+        ui.flash("settings", "success", "Οι ρυθμίσεις αποθηκεύτηκαν. Ισχύουν από τον επόμενο "
+                                        "υπολογισμό προτάσεων.")
         st.rerun()
     except ValueError as e:
         st.error(str(e))
-
-st.markdown('<p class="ne-muted">Η αποστολή μηνύματος στον πελάτη μετά την έγκριση δεν είναι '
-            'ακόμα ενεργή· προς το παρόν η επιλογή μόνο αποθηκεύεται.</p>',
-            unsafe_allow_html=True)
