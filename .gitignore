@@ -13,3 +13,5 @@ draft_orders/
 # Generated submissions
 submissions/
 config/settings.json
+# Approved purchase orders (warehouse agent)
+purchase_orders/
