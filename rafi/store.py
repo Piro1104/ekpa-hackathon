@@ -288,6 +288,192 @@ def history(trdr=None, suggestion_id=None, db=None):
     return out
 
 
+# --- purchase suggestions (warehouse agent) ------------------------------------
+# Our own orders to suppliers. They never go to the mock ERP (it takes customers only):
+# ΠΡΟΤΑΣΗ -> ΕΓΚΡΙΘΗΚΕ (JSON written to purchase_orders/) or ΠΡΟΤΑΣΗ -> ΑΠΟΡΡΙΦΘΗΚΕ (reason).
+# One suggestion per (item, ORDER_BY), whatever its status.
+
+APPROVED = "ΕΓΚΡΙΘΗΚΕ"
+PURCHASE_DIR = ROOT / "purchase_orders"
+
+PURCHASE_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS purchase_suggestions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT NOT NULL,
+    mtrl          INTEGER NOT NULL,
+    supplier_id   TEXT NOT NULL,
+    order_by      TEXT NOT NULL,
+    arrival       TEXT NOT NULL,
+    qty           INTEGER NOT NULL,
+    value_eur     REAL,
+    flag          TEXT,
+    payload_json  TEXT NOT NULL,
+    status        TEXT NOT NULL CHECK (status IN ('{PROPOSED}', '{APPROVED}', '{REJECTED}')),
+    file_path     TEXT,
+    UNIQUE (mtrl, order_by)
+);
+CREATE TABLE IF NOT EXISTS purchase_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    purchase_id   INTEGER NOT NULL REFERENCES purchase_suggestions(id),
+    at            TEXT NOT NULL,
+    user          TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    details_json  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_purchase_status ON purchase_suggestions(status);
+CREATE INDEX IF NOT EXISTS ix_purchase_history ON purchase_history(purchase_id);
+"""
+
+
+def _purchase_connect(db=None):
+    conn = connect(db)
+    conn.executescript(PURCHASE_SCHEMA)
+    return conn
+
+
+@contextmanager
+def _purchase_transaction(db):
+    conn = _purchase_connect(db)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def _purchase_log(conn, purchase_id, user, action, details=None):
+    conn.execute("INSERT INTO purchase_history (purchase_id, at, user, action, details_json) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                 (purchase_id, _now(), str(user), action,
+                  _dumps(details) if details is not None else None))
+
+
+def _purchase_row(conn, purchase_id):
+    r = conn.execute("SELECT * FROM purchase_suggestions WHERE id = ?", (purchase_id,)).fetchone()
+    if r is None:
+        raise StoreError(f"Δεν υπάρχει πρόταση αγοράς με id {purchase_id}.")
+    return r
+
+
+def save_purchase_new(orders, user="system", db=None):
+    """Save purchase suggestions; one with the same MTRL and ORDER_BY as any saved one is skipped.
+
+    `orders`: dicts with at least MTRL, SUPPLIER_ID, ORDER_BY, ARRIVAL, QTY (dates as text).
+    Returns {"saved": [ids], "skipped": count}.
+    """
+    saved, skipped = [], 0
+    with _purchase_transaction(db) as conn:
+        for o in orders:
+            exists = conn.execute("SELECT 1 FROM purchase_suggestions WHERE mtrl = ? "
+                                  "AND order_by = ?", (int(o["MTRL"]), o["ORDER_BY"])).fetchone()
+            if exists:
+                skipped += 1
+                continue
+            cur = conn.execute(
+                "INSERT INTO purchase_suggestions (created_at, mtrl, supplier_id, order_by, "
+                "arrival, qty, value_eur, flag, payload_json, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (_now(), int(o["MTRL"]), str(o["SUPPLIER_ID"]), o["ORDER_BY"], o["ARRIVAL"],
+                 int(o["QTY"]), o.get("VALUE_EUR"), o.get("FLAG") or None, _dumps(o), PROPOSED))
+            _purchase_log(conn, cur.lastrowid, user, CREATE,
+                          {"qty": int(o["QTY"]), "order_by": o["ORDER_BY"],
+                           "flag": o.get("FLAG") or None, "reason": o.get("REASON")})
+            saved.append(cur.lastrowid)
+    return {"saved": saved, "skipped": skipped}
+
+
+def purchase_order_json(row):
+    """The purchase order written after approval: SUPPLIER, LINES, ORDER_BY, ARRIVAL, REASON."""
+    p = json.loads(row["payload_json"])
+    return {
+        "PURCHASE_SUGGESTION_ID": row["id"],
+        "SUPPLIER": {"SUPPLIER_ID": p["SUPPLIER_ID"], "NAME": p.get("SUPPLIER_NAME")},
+        "LINES": [{"MTRL": int(p["MTRL"]), "ITEM_CODE": p.get("ITEM_CODE"),
+                   "ITEM_NAME": p.get("ITEM_NAME"), "QTY": int(row["qty"]),
+                   "UNIT": p.get("UNIT")}],
+        "ORDER_BY": row["order_by"],
+        "ARRIVAL": row["arrival"],
+        "REASON": p.get("REASON"),
+    }
+
+
+def approve_purchase(purchase_id, user, db=None, out_dir=None):
+    """ΠΡΟΤΑΣΗ -> ΕΓΚΡΙΘΗΚΕ and write purchase_orders/<id>.json. Never approves twice.
+
+    The status change and the file are one step: if the file cannot be written, the
+    suggestion stays ΠΡΟΤΑΣΗ. Returns the file path.
+    """
+    out_dir = Path(out_dir or PURCHASE_DIR)
+    with _purchase_transaction(db) as conn:
+        r = _purchase_row(conn, purchase_id)
+        cur = conn.execute("UPDATE purchase_suggestions SET status = ? WHERE id = ? AND status = ?",
+                           (APPROVED, purchase_id, PROPOSED))
+        if cur.rowcount != 1:
+            raise StoreError(f"Η πρόταση αγοράς {purchase_id} είναι {r['status']}· "
+                             f"έγκριση γίνεται μόνο σε {PROPOSED}.")
+        doc = purchase_order_json(r)
+        doc["APPROVED_BY"], doc["APPROVED_AT"] = str(user), _now()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{purchase_id}.json"
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        conn.execute("UPDATE purchase_suggestions SET file_path = ? WHERE id = ?",
+                     (str(path), purchase_id))
+        _purchase_log(conn, purchase_id, user, APPROVE, {"file": str(path)})
+    return path
+
+
+def reject_purchase(purchase_id, reason, user, db=None):
+    """ΠΡΟΤΑΣΗ -> ΑΠΟΡΡΙΦΘΗΚΕ, with a reason (required)."""
+    if not reason or not str(reason).strip():
+        raise StoreError("Η απόρριψη χρειάζεται λόγο.")
+    with _purchase_transaction(db) as conn:
+        r = _purchase_row(conn, purchase_id)
+        cur = conn.execute("UPDATE purchase_suggestions SET status = ? WHERE id = ? AND status = ?",
+                           (REJECTED, purchase_id, PROPOSED))
+        if cur.rowcount != 1:
+            raise StoreError(f"Η πρόταση αγοράς {purchase_id} είναι {r['status']}· "
+                             f"απόρριψη γίνεται μόνο σε {PROPOSED}.")
+        _purchase_log(conn, purchase_id, user, REJECT, {"reason": str(reason).strip()})
+
+
+def list_purchase_suggestions(status=None, db=None):
+    """Purchase suggestions with their payload, most urgent (earliest ORDER_BY) first."""
+    sql, args = "SELECT * FROM purchase_suggestions WHERE 1 = 1", []
+    if status:
+        sql += " AND status = ?"
+        args.append(status)
+    conn = _purchase_connect(db)
+    try:
+        rows = conn.execute(sql + " ORDER BY order_by, id", args).fetchall()
+        return [_as_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def purchase_history(purchase_id=None, db=None):
+    """History of the purchase suggestions, oldest first."""
+    sql, args = "SELECT * FROM purchase_history WHERE 1 = 1", []
+    if purchase_id is not None:
+        sql += " AND purchase_id = ?"
+        args.append(int(purchase_id))
+    conn = _purchase_connect(db)
+    try:
+        rows = conn.execute(sql + " ORDER BY id", args).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["details"] = json.loads(d.pop("details_json")) if d["details_json"] else None
+        out.append(d)
+    return out
+
+
 # --- CLI -------------------------------------------------------------------
 
 def _print_list(rows):
