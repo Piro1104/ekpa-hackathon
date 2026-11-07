@@ -168,6 +168,10 @@ def _route_note(flags):
     return "κανονικό δρομολόγιο"
 
 
+def _items(n):
+    return "1 είδος" if n == 1 else f"{n} είδη"
+
+
 def _qty_list(lines):
     """'4 κιβ. Νερό ..., 2 τεμ. ...' without a trailing dot (the sentence adds its own)."""
     return ", ".join(f"{l['qty']} {l['unit']} {l['name']}" for l in lines).rstrip(".")
@@ -187,24 +191,29 @@ def template_texts(facts):
             head = f"Το «{f['name']}» έχει πιθανότατα ήδη τελειώσει"
         else:
             head = f"Το «{f['name']}» τελειώνει περίπου {_dm(f['depletion'])}"
-        parts = [head]
         if f.get("rate_per_day"):
-            parts.append(f"ο πελάτης καταναλώνει ~{_num(f['rate_per_day'])} {f['unit']}/ημέρα "
-                         f"τον {facts['month']}")
+            head += (f", με κατανάλωση ~{_num(f['rate_per_day'])} {f['unit']}/ημέρα "
+                     f"τον {facts['month']}")
+        sentences = [head + "."]
         if len(lines) > 1:
-            parts.append(f"άλλα {len(lines) - 1} είδη τελειώνουν πριν την επόμενη κανονική "
-                         f"επίσκεψη ({_day(facts['next_visit'])})")
+            n = len(lines) - 1
+            sentences.append(f"{'Άλλο 1 είδος τελειώνει' if n == 1 else f'Άλλα {n} είδη τελειώνουν'}"
+                             f" πριν την επόμενη κανονική επίσκεψη ({_day(facts['next_visit'])}).")
         lost = _eur(facts["lost_eur"])
         cost = _eur(facts["extra_route_cost_eur"])
         if MARGINAL in facts["flags"]:
-            parts.append(f"εκτιμώμενες χαμένες πωλήσεις ~{lost} € μέχρι την κανονική επίσκεψη, "
-                         f"λιγότερες από το κόστος έκτακτου δρομολογίου (~{cost} €)")
+            sentences.append(f"Μέχρι την κανονική επίσκεψη οι εκτιμώμενες χαμένες πωλήσεις είναι "
+                             f"~{lost} €, λιγότερες από το κόστος έκτακτου δρομολογίου "
+                             f"(~{cost} €), οπότε η παράδοση μένει στο κανονικό δρομολόγιο, "
+                             f"{_day(delivery)}.")
         elif URGENT in facts["flags"] or EXTRA_ROUTE in facts["flags"]:
-            parts.append(f"εκτιμώμενες χαμένες πωλήσεις ~{lost} € αν περιμέναμε την κανονική "
-                         f"επίσκεψη ({_day(facts['usual_visit'])}), περισσότερες από το κόστος "
-                         f"έκτακτου δρομολογίου (~{cost} €)")
-        parts.append(f"παράδοση {_day(delivery)} ({_route_note(facts['flags'])})")
-        reason = "· ".join(parts) + "."
+            sentences.append(f"Αν περιμέναμε την κανονική επίσκεψη ({_day(facts['usual_visit'])}), "
+                             f"οι εκτιμώμενες χαμένες πωλήσεις θα ήταν ~{lost} €, περισσότερες από "
+                             f"το κόστος έκτακτου δρομολογίου (~{cost} €). Γι' αυτό προτείνουμε "
+                             f"παράδοση {_day(delivery)} ({_route_note(facts['flags'])}).")
+        else:
+            sentences.append(f"Προτείνουμε παράδοση {_day(delivery)} με το κανονικό δρομολόγιο.")
+        reason = " ".join(sentences)
         promo = [l for l in lines if l.get("promo_disc")]
         if promo:
             reason += " Σε προσφορά την ημέρα παράδοσης: " + ", ".join(
@@ -225,29 +234,34 @@ def template_texts(facts):
         return {"REASON": reason, "SALES_NOTE": note}
 
     if kind == LOSS:
-        reason = (f"Ο πελάτης παρήγγελνε κάθε ~{facts['median_interval']:.0f} ημέρες, αλλά η "
-                  f"τελευταία παράδοση ήταν {_dm(facts['last_delivery'])} "
-                  f"(πριν {facts['days_silent']} ημέρες).")
+        last, n_items = _dm(facts["last_delivery"]), _items(len(lines))
+        bought = f"Τους τελευταίους 12 μήνες αγόρασε {_eur(facts['purchases_12m_eur'])} €."
         if facts.get("usual_close"):
-            reason += (f" Συνήθως κλείνει για τον χειμώνα γύρω στις {_dm(facts['usual_close'])}, "
-                       f"άρα σταμάτησε {facts['days_early']} ημέρες νωρίτερα από το συνηθισμένο.")
-        reason += f" Αγορές τελευταίων 12 μηνών: {_eur(facts['purchases_12m_eur'])} €."
+            # a winter closer that stopped much earlier than usual
+            reason = (f"Κλείνει κάθε χειμώνα γύρω στις {_dm(facts['usual_close'])}, αλλά φέτος η "
+                      f"τελευταία παράδοση ήταν {last}, {facts['days_early']} ημέρες νωρίτερα. "
+                      f"Μέχρι τότε παρήγγελνε κάθε ~{facts['median_interval']:.0f} ημέρες. "
+                      + bought)
+        else:
+            reason = (f"Ο πελάτης παρήγγελνε κάθε ~{facts['median_interval']:.0f} ημέρες, αλλά "
+                      f"έχει να πάρει παράδοση από τις {last}, δηλαδή {facts['days_silent']} "
+                      f"ημέρες. " + bought)
         if facts.get("closed_now"):
             reopen = facts["usual_reopen"]
-            reason += (f" Το κατάστημα είναι τώρα κλειστό για τη σεζόν. Προτείνουμε τηλεφώνημα "
-                       f"τώρα για να μάθουμε γιατί σταμάτησε νωρίτερα, και παραγγελία "
-                       f"επαναλειτουργίας για {_day_year(delivery)} (συνήθως ανοίγει γύρω στις "
-                       f"{_dm(reopen)}) με το συνηθισμένο καλάθι του ({len(lines)} είδη, "
-                       f"ποσότητες για τον {MONTHS[pd.Timestamp(delivery).month - 1]}).")
+            reason += (f" Το κατάστημα είναι τώρα κλειστό για τη σεζόν, οπότε προτείνουμε "
+                       f"τηλεφώνημα τώρα για να μάθουμε γιατί σταμάτησε νωρίτερα. Για την "
+                       f"επαναλειτουργία (συνήθως γύρω στις {_dm(reopen)}) ετοιμάζουμε "
+                       f"παραγγελία για {_day_year(delivery)} με το συνηθισμένο καλάθι του: "
+                       f"{n_items}, σε ποσότητες για τον "
+                       f"{MONTHS[pd.Timestamp(delivery).month - 1]}.")
             note = (f"{hello} Θέλαμε να μάθουμε πώς πήγε η σεζόν και αν είναι όλα εντάξει· "
                     f"είδαμε ότι φέτος οι παραγγελίες σταμάτησαν από τις "
                     f"{_dm(facts['last_delivery'])}. Για την επαναλειτουργία σας, να "
                     f"κλειδώσουμε από τώρα μια παραγγελία για {_day_year(delivery)} με: "
                     f"{_qty_list(lines)}; Αν θέλετε αλλαγές, τις κάνουμε μαζί.")
             return {"REASON": reason, "SALES_NOTE": note}
-        reason += (f" Προτείνουμε επικοινωνία και το συνηθισμένο καλάθι του "
-                   f"({len(lines)} είδη, ποσότητες προσαρμοσμένες στην εποχή) "
-                   f"για {_day(delivery)}.")
+        reason += (f" Προτείνουμε τηλεφώνημα και το συνηθισμένο καλάθι του ({n_items}, σε "
+                   f"ποσότητες για την εποχή) με παράδοση {_day(delivery)}.")
         note = (f"{hello} Έχουμε να σας εξυπηρετήσουμε από τις {_dm(facts['last_delivery'])} "
                 f"και θέλαμε να δούμε αν όλα πάνε καλά ή αν χρειάζεστε κάτι διαφορετικό. "
                 f"Μπορούμε να σας φέρουμε {_day(delivery)} τα συνηθισμένα σας: "
@@ -260,8 +274,8 @@ def template_texts(facts):
     w = lines[0]
     reason = (f"Πέρσι ο πελάτης πήρε συνολικά {season} στην περίοδο "
               f"{_dm(w['window_start'])}–{_dm(w['window_end'])}. Τα εποχικά πωλούνται ξανά "
-              f"από {_dm(w['window_start'])}· επειδή είναι ευπαθή, προτείνουμε όσο η περσινή "
-              f"πρώτη παράδοση ({first}) με παράδοση {_day(delivery)} "
+              f"από {_dm(w['window_start'])}. Επειδή είναι ευπαθή, προτείνουμε για αρχή όσο "
+              f"και η περσινή πρώτη παράδοση ({first}), με παράδοση {_day(delivery)} "
               f"({_route_note(facts['flags'])}).")
     note = (f"{hello} Ξεκινά η περίοδος για τα εποχικά. Για αρχή σας προτείνουμε {first}, "
             f"όσο και στην πρώτη παραγγελία σας πέρσι, με παράδοση {_day(delivery)}. "
