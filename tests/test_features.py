@@ -4,8 +4,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from rafi.features import (likely_closer, next_working_day, route_days, seasonal_factors,
-                           winter_closers, winter_history, working_day)
+from rafi.features import (is_closed_on, likely_closer, next_working_day, route_days,
+                           seasonal_factors, winter_closers, winter_history, working_day)
 from rafi.ingest import build_deliveries, load_from_files
 
 DATA = Path(__file__).resolve().parents[1] / "data"
@@ -68,6 +68,14 @@ def test_seasonal_factors_crete_summer_much_higher_than_november(data):
     assert crete[7] > 4 * crete[11]
 
 
+def test_seasonal_factors_for_an_empty_group_are_one(data):
+    # e.g. the "closer" group at a cutoff where no closer has been seen yet
+    deliveries, customers, items = data
+    f = seasonal_factors(deliveries, customers, items, "2025-10-31", include=[])
+    assert len(f) > 0 and (f["FACTOR"] == 1.0).all()
+    assert set(f["MONTH"]) == set(range(1, 13))
+
+
 def test_seasonal_factors_ignore_the_future(data):
     deliveries, customers, items = data
     cutoff = D("2025-10-31")
@@ -112,3 +120,11 @@ def test_likely_closer_for_new_island_customers(data):
     assert likely_closer(1078, customers, history)[0] is False
     # new café-bar in Athens
     assert likely_closer(1020, customers, history)[0] is False
+
+
+def test_is_closed_on_handles_missing_dates():
+    # a closer that has not re-opened yet has no FIRST_AFTER_OPEN; it may arrive as NaN
+    assert is_closed_on("2026-12-15", "10-20", float("nan"))      # default re-open 1/4
+    assert not is_closed_on("2026-05-15", "10-20", float("nan"))
+    assert not is_closed_on("2026-12-15", float("nan"), None)      # no closing date -> open
+    assert is_closed_on("2026-12-15", "10-20", "04-10")

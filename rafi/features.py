@@ -108,6 +108,12 @@ def seasonal_factors(deliveries, customers, items, cutoff, exclude=(), include=N
     d = d.merge(customers[["TRDR", "AREA"]], on="TRDR").merge(items[["MTRL", "MTRCATEGORY"]], on="MTRL")
     d = d.assign(PERIOD=d["TRNDATE"].dt.to_period("M"))
     d = d[d["PERIOD"] <= last_full_month]
+    if d.empty:
+        # no data for this group (e.g. no winter closers yet): neutral factor 1
+        combos = (customers[["AREA"]].drop_duplicates()
+                  .merge(items[["MTRCATEGORY"]].drop_duplicates(), how="cross"))
+        out = combos.merge(pd.DataFrame({"MONTH": range(1, 13)}), how="cross").assign(FACTOR=1.0)
+        return out[["AREA", "MTRCATEGORY", "MONTH", "FACTOR"]].reset_index(drop=True)
 
     combos = d[["AREA", "MTRCATEGORY"]].drop_duplicates()
     first = d["PERIOD"].min()
@@ -219,10 +225,11 @@ def is_closed_on(date, last_before_close, first_after_open):
     The cutoff day itself counts as closed when it equals the typical last delivery day:
     that delivery is the stock for the closing, not for normal consumption.
     """
-    if last_before_close is None:
+    # Missing values may arrive as None or NaN (after a DataFrame round trip).
+    if not isinstance(last_before_close, str):
         return False
     doy = _day_of_year(date)
     last = _day_of_year(f"{REFERENCE_YEAR}-{last_before_close}")
     first = (_day_of_year(f"{REFERENCE_YEAR}-{first_after_open}")
-             if first_after_open else _day_of_year(f"{REFERENCE_YEAR}-04-01"))
+             if isinstance(first_after_open, str) else _day_of_year(f"{REFERENCE_YEAR}-04-01"))
     return doy >= last or doy < first

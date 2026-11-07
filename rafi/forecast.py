@@ -179,7 +179,10 @@ def _closure_status(customers, history, cutoff):
 
 def _group_factors(deliveries, customers, items, cutoff, closers):
     """Common factors (GROUP "all") plus factors of the closers and of everyone else."""
-    parts = [seasonal_factors(deliveries, customers, items, cutoff).assign(GROUP="all"),
+    common = seasonal_factors(deliveries, customers, items, cutoff).assign(GROUP="all")
+    if not closers:
+        return common  # no closers seen yet (early cutoffs): only the common factors
+    parts = [common,
              seasonal_factors(deliveries, customers, items, cutoff,
                               include=closers).assign(GROUP="closer"),
              seasonal_factors(deliveries, customers, items, cutoff,

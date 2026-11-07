@@ -147,6 +147,16 @@ def test_output_is_complete_and_sane(official):
     assert (official["STOCK_AT_CUTOFF"].dropna() >= 0).all()
 
 
+@pytest.mark.parametrize("cutoff", ["2024-11-01", "2025-04-04"])
+def test_forecast_runs_at_early_cutoffs(data, cutoff):
+    # before any winter closer is known, and while a closer has not re-opened yet
+    deliveries, customers, items = data
+    past = deliveries[deliveries["TRNDATE"] <= cutoff]
+    targets = make_targets(past, customers, cutoff)
+    out = forecast(daily_qty(past), past, customers, items, targets, cutoff)
+    assert len(out) == len(targets)
+
+
 # --- submission ----------------------------------------------------------
 
 def _load_script():
