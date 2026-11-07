@@ -20,11 +20,14 @@ everything = ui.warehouse_orders(wh.ALL_DAYS) or []
 m = wh.metrics(orders)
 ui.tiles([
     ("Παραγγελίες προς έγκριση", h.fmt_num(m["orders"]), "", ""),
-    ("Δεν φτάνει η αποθήκη", h.fmt_num(m["short_items"]),
+    ("Ελλείψεις αποθήκης", h.fmt_num(m["short_items"]),
      f"{'είδος' if m['short_items'] == 1 else 'είδη'} · {m['short_deliveries']} "
-     f"παραδόσεις σε πελάτες", "warn" if m["short_items"] else ""),
+     f"παραδόσεις σε πελάτες δεν καλύπτονται", "warn" if m["short_items"] else ""),
+    ("Αργήσαμε", h.fmt_num(m["late_items"]),
+     f"{'είδος' if m['late_items'] == 1 else 'είδη'} · πελάτες καλυμμένοι, κάτω από το "
+     f"απόθεμα ασφαλείας", ""),
     ("Αξία σε τιμή καταλόγου", h.fmt_eur(m["value_eur"]), "", ""),
-])
+], cols=4)
 
 keys = [wh.order_key(o) for o in orders]
 if state.get("selected_po") not in keys:
@@ -45,7 +48,7 @@ with left, st.container(key="ne_list"):
                     unsafe_allow_html=True)
     for o in orders:
         key = wh.order_key(o)
-        t = ui.tag("Δεν φτάνει", "short") if o.get("short") else ui.tag("Αγορά", "buy")
+        t = ui.tag(*wh.tag_of(o))
         ui.card(key, t, o.get("supplier_name") or o.get("supplier_id"), "", wh.card_line(o),
                 key == state["selected_po"], pick, (key,))
     st.markdown(f'<p class="ne-muted">Μία παραγγελία ανά προμηθευτή και ημερομηνία. '
@@ -58,17 +61,18 @@ with right:
     o = selected
     key = wh.order_key(o)
     supplier = o.get("supplier_name") or o.get("supplier_id")
-    ai_text = h.is_ai(o.get("source")) or h.is_ai(o.get("TEXT_SOURCE"))
+    ai_note = h.is_ai(o.get("note_source"))
+    kind = wh.status(o)
 
     with st.container(key="ne_panel_warehouse"):
-        tags = ui.tag("Αποθήκη", "wh") + (ui.tag("Δεν φτάνει", "short") if o.get("short") else "")
+        tags = ui.tag("Αποθήκη", "wh") + (ui.tag(*wh.tag_of(o)) if kind else "")
         st.markdown(f'{tags}<div class="ne-title">{ui.esc(supplier)}</div>',
                     unsafe_allow_html=True)
         ui.numbers([("Παράγγειλε έως", h.fmt_day(o.get("order_by"))),
                     ("Φτάνει", h.fmt_day(o.get("arrival"))),
                     ("Αξία (τιμή καταλόγου)", h.fmt_eur(o.get("total_value_eur")))])
 
-        ui.label_row("Τι προτείνουμε και γιατί", ai_text)
+        ui.label_row("Τι προτείνουμε και γιατί")
         st.markdown(f'<div class="ne-reason">{ui.esc(o.get("reason") or "—")}</div>',
                     unsafe_allow_html=True)
 
@@ -77,19 +81,24 @@ with right:
         ui.table(df, height=38 + 35 * max(1, len(df)))
 
         affected = o.get("affected_deliveries") or []
-        if o.get("short") and affected:
+        if kind == wh.SHORT and affected:
             st.markdown(
-                f'<div class="ne-warn"><b>Επηρεάζονται {len(affected)} παραδόσεις σε πελάτες '
+                f'<div class="ne-warn"><b>{wh.affected_phrase(len(affected))} '
                 f'πριν τις {h.dm(o.get("arrival"))}</b><br>{ui.esc(wh.affected_text(o))}<br>'
-                f'<span class="small">Με το απόθεμα που υπάρχει εξυπηρετούνται πρώτα τα '
-                f'επείγοντα και οι μεγαλύτεροι πελάτες.</span></div>', unsafe_allow_html=True)
-            with st.expander("Όλες οι παραδόσεις που επηρεάζονται"):
+                f'<span class="small">Δεν καλύπτονται από το απόθεμα. Με ό,τι υπάρχει '
+                f'εξυπηρετούνται πρώτα τα επείγοντα και οι μεγαλύτεροι πελάτες.</span></div>',
+                unsafe_allow_html=True)
+            with st.expander("Όλες οι παραδόσεις που δεν καλύπτονται"):
                 for a in sorted(affected, key=lambda a: str(a.get("date"))):
                     st.markdown(f"{ui.esc(a.get('customer_name') or a.get('trdr'))} · "
                                 f"{h.fmt_day(a.get('date'))} · {h.fmt_qty(a.get('qty'))}")
             st.write("")
+        elif kind == wh.LATE:
+            st.markdown(f'<div class="ne-reason"><b>Αργήσαμε.</b> {ui.esc(wh.late_text(o))}</div>',
+                        unsafe_allow_html=True)
+            st.write("")
 
-        ui.label_row("Μήνυμα προς τον προμηθευτή", ai_text)
+        ui.label_row("Μήνυμα προς τον προμηθευτή", ai_note)
         st.markdown(f'<div class="ne-note blue">{ui.esc(o.get("note") or "—")}</div>',
                     unsafe_allow_html=True)
         st.write("")
