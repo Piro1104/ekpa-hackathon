@@ -1,4 +1,5 @@
 """Telegram bot with a fake Telegram API and a fake ERP: no real network calls."""
+import json
 import sys
 import types
 
@@ -606,3 +607,95 @@ def test_whoami_roles():
     assert tb.role_text(333, SUPPLIER_CFG) == "  ← προμηθευτής demo"
     assert tb.role_text(111, SUPPLIER_CFG) == "  ← Διαχειριστής"
     assert tb.role_text(9, SUPPLIER_CFG) == ""
+
+
+# --- free question of the Administrator ------------------------------------------
+
+def say(bot, text, chat=ADMIN):
+    return bot.handle({"update_id": 1, "message": {"text": text, "chat": {"id": int(chat)}}})
+
+
+@pytest.mark.parametrize("question", ["Με ποιον να ξεκινήσω σήμερα;",
+                                      "Τι παραγγέλνουμε αυτή την εβδομάδα;",
+                                      "Πόση είναι η αξία σε κίνδυνο;"])
+def test_free_question_goes_to_the_assistant(db, monkeypatch, question):
+    path, _ = db
+    monkeypatch.setenv("LLM_MODE", "mock")
+    api = FakeApi()
+    say(tb.Bot(api, CFG, path), question)
+    text = api.texts(ADMIN)[-1]
+    assert text.startswith("[MOCK]") and f"«{question}»" in text
+    assert text.endswith(f"<i>({tb.h.AI_BADGE})</i>")
+
+
+def test_question_context_has_summary_needs_you_and_the_week(db, monkeypatch):
+    path, ids = db
+    _real_warehouse(path)
+    monkeypatch.delitem(sys.modules, "rafi.agents.orchestrator")  # the real orchestrator
+    from rafi import llm
+    seen = {}
+
+    def fake_answer(question, context):
+        seen.update(q=question, ctx=context)
+        return {"text": "Ξεκίνα από το Hotel Ιόνιο (250,00 €).", "source": llm.AI}
+    monkeypatch.setattr(llm, "answer", fake_answer)
+    api = FakeApi()
+    say(tb.Bot(api, CFG, path), "Με ποιον να ξεκινήσω σήμερα;")
+    assert api.texts(ADMIN)[-1].startswith("Ξεκίνα από το Hotel Ιόνιο (250,00 €).")
+    ctx = seen["ctx"]
+    assert ctx["πελάτες"]["προς_έγκριση"] == 5 and ctx["πελάτες"]["αξία_σε_κίνδυνο_eur"] == 510.5
+    needs = ctx["χρειάζονται_εσένα"]
+    assert needs[0]["πελάτης"] == "Hotel Ιόνιο Μ.Ε.Π.Ε."
+    assert set(needs[0]) == {"πελάτης", "κωδικός", "τύπος", "παράδοση", "αξία_eur", "φράση"}
+    assert needs[0]["φράση"] == "Το νερό τελειώνει περίπου 6/11"
+    week = ctx["παραγγελίες_αποθήκης_εβδομάδας"]
+    assert [(o["προμηθευτής"], o["κατάσταση"]) for o in week] == [
+        ("Προμηθευτής S07 Α.Ε.", "Έλλειψη"), ("Προμηθευτής S08 Α.Ε.", "Αργήσαμε"),
+        ("Προμηθευτής S05 Α.Ε.", "κανονική")]
+    assert week[0]["αξία_eur"] == 460.8 and week[0]["πελάτες_που_δεν_καλύπτονται"] == 2
+    assert ctx["αποθήκη"] == {"παραγγελίες_εβδομάδας": 3, "ελλείψεις": 1, "αργήσαμε": 1}
+    json.dumps(ctx, ensure_ascii=False)
+
+
+def test_assistant_down_gives_a_short_message(db, monkeypatch):
+    path, _ = db
+    from rafi import llm
+    monkeypatch.setenv("LLM_MODE", "local")
+
+    def down(*a, **k):
+        raise llm.requests.ConnectionError("no ollama")
+    monkeypatch.setattr(llm.requests, "post", down)  # never a real Ollama
+    api = FakeApi()
+    say(tb.Bot(api, CFG, path), "Πόση είναι η αξία σε κίνδυνο;")
+    assert api.texts(ADMIN)[-1] == tb.ASSISTANT_DOWN
+    monkeypatch.setattr(llm, "answer", lambda q, c: 1 / 0)
+    say(tb.Bot(api, CFG, path), "Τι παραγγέλνουμε;")
+    assert api.texts(ADMIN)[-1] == tb.ASSISTANT_DOWN
+
+
+def test_only_the_admin_text_goes_to_the_assistant(db, monkeypatch):
+    path, ids = db
+    from rafi import llm
+    monkeypatch.setattr(llm, "answer", lambda q, c: pytest.fail("no AI for this message"))
+    api = FakeApi()
+    bot = tb.Bot(api, SUPPLIER_CFG, path)
+    say(bot, "Θέλουμε και νερά", CUSTOMER)
+    assert api.texts(ADMIN)[-1] == "Ο πελάτης του demo απάντησε:\n«Θέλουμε και νερά»"
+    say(bot, "Έρχονται Δευτέρα", "333")
+    assert api.texts(ADMIN)[-1] == "Ο προμηθευτής του demo απάντησε:\n«Έρχονται Δευτέρα»"
+    say(bot, "κάτι", "999")  # unknown chat: ignored
+    assert len(api.sent()) == 2
+    # after «Ρώτα» on a suggestion the question is about that suggestion
+    calls = []
+    monkeypatch.setattr(tb.h, "ask_assistant", lambda q, c: calls.append(q) or
+                        {"text": "Για την πρόταση.", "source": "AI"})
+    press(bot, f"q:{ids[0]}")
+    say(bot, "Γιατί έκτακτο;")
+    assert calls == ["Γιατί έκτακτο;"] and api.texts(ADMIN)[-1].startswith("Για την πρόταση.")
+
+
+def test_brief_invites_questions(db):
+    path, _ = db
+    first = tb.brief_messages(path)[0][0]
+    assert first.rstrip().endswith(
+        "Μπορείς να μου γράψεις και ερώτηση, π.χ. \"Με ποιον να ξεκινήσω σήμερα;\"")

@@ -48,6 +48,8 @@ PURCHASE_REASONS = ["Υπάρχει ακόμα απόθεμα", "Θα παραγ
 OTHER = "Άλλο"
 SHORT, LATE = "ΕΛΛΕΙΨΗ", "ΑΡΓΗΣΑΜΕ"  # statuses of rafi.agents.warehouse_agent
 OLD_TOO_LATE = "ΔΕΝ_ΦΤΑΝΕΙ"           # older flag, read as ΕΛΛΕΙΨΗ
+ASSISTANT_DOWN = "Ο βοηθός δεν είναι διαθέσιμος τώρα· δες το dashboard."
+ASK_HINT = 'Μπορείς να μου γράψεις και ερώτηση, π.χ. "Με ποιον να ξεκινήσω σήμερα;"'
 LEGAL_SUFFIXES = ("Μ.Ε.Π.Ε.", "Ι.Κ.Ε.", "Α.Ε.", "Ο.Ε.", "Ε.Ε.")
 
 
@@ -334,6 +336,7 @@ def brief_messages(db=None):
                  f"{h.fmt_num(_first(w, 'short_count', default=states.count(SHORT)))}",
                  f"Αργήσαμε (πελάτες καλυμμένοι): "
                  f"{h.fmt_num(_first(w, 'late_count', default=states.count(LATE)))}"]
+    text += ["", esc(ASK_HINT)]
     out.append(("\n".join(text), None))
 
     # (b) needs you
@@ -385,6 +388,77 @@ def send_brief(api, cfg, db=None):
     for text, keyboard in msgs:
         send(api, cfg["TELEGRAM_ADMIN_CHAT_ID"], text, keyboard)
     return len(msgs)
+
+
+# --- general question ---------------------------------------------------------
+
+def _one_line(text, limit=140):
+    try:
+        from rafi.agents.orchestrator import one_line
+        return one_line(text, limit)
+    except Exception:
+        first = str(text or "").strip().split(". ")[0].rstrip(".")
+        return first[:limit]
+
+
+def question_context(db=None, today=h.SCENARIO_TODAY):
+    """What the assistant may use for a free question of the Administrator: the morning
+    summary (customers and warehouse), the "needs you" list and the warehouse orders of
+    the week, each with a name, a date, € and one sentence. Only numbers from here."""
+    summary = morning_summary(db)
+    c, w, suggestions = summary["customers"], summary["warehouse"], summary["suggestions"]
+    by_id = {s["id"]: s for s in suggestions}
+    needs = []
+    for i in c["needs_you"]:
+        s = by_id.get(i)
+        if s is None or s["status"] != h.PROPOSED:
+            continue
+        name, code = customer_of(s)
+        needs.append({"πελάτης": name, "κωδικός": code, "τύπος": kind_text(s),
+                      "παράδοση": s["delivery_date"], "αξία_eur": s["value_eur"],
+                      "φράση": _one_line(s["payload"].get("REASON"))})
+    n = c["counts"]
+    ctx = {
+        "σήμερα": pd.Timestamp(today).strftime("%Y-%m-%d"),
+        "πελάτες": {"προς_έγκριση": n.get("pending"),
+                    "έκτακτα_δρομολόγια": n.get("extra_routes"),
+                    "κίνδυνοι_απώλειας": n.get("loss_risks"),
+                    "οριακές": n.get("marginal"),
+                    "παραγγελίες": n.get("orders"),
+                    "προσφορές": n.get("offers"),
+                    "αξία_σε_κίνδυνο_eur": c["value_at_risk_eur"],
+                    "αξία_προσφορών_eur": c["offers_value_eur"]},
+        "χρειάζονται_εσένα": needs,
+    }
+    if w is None:
+        ctx["αποθήκη"] = f"Η σύνοψη της αποθήκης {NOT_AVAILABLE}."
+        return ctx
+    states = [order_status(o) for o in w.get("orders") or []]
+    ctx["αποθήκη"] = {"παραγγελίες_εβδομάδας": _first(w, "orders_count", default=len(states)),
+                      "ελλείψεις": _first(w, "short_count", default=states.count(SHORT)),
+                      "αργήσαμε": _first(w, "late_count", default=states.count(LATE))}
+    ctx["παραγγελίες_αποθήκης_εβδομάδας"] = [
+        {"προμηθευτής": g["supplier_name"], "παραγγελία_έως": g["order_by"],
+         "άφιξη": g["arrival"], "αξία_eur": round(g["value_eur"], 2),
+         "κατάσταση": h.label(g["status"]) if g["status"] else "κανονική",
+         "πελάτες_που_δεν_καλύπτονται": g["uncovered"],
+         "φράση": _one_line(g["reason"])}
+        for g in supplier_orders(w, today)]
+    return ctx
+
+
+def answer_question(question, db=None):
+    """(text, from AI) for a free question of the Administrator. The assistant answers only
+    from question_context; if it cannot, a short message to look at the dashboard."""
+    from rafi import llm
+    try:
+        out = llm.answer(question, question_context(db))
+    except Exception as e:  # never let a question break the bot
+        log.warning("answer_question: %s", type(e).__name__)
+        return ASSISTANT_DOWN, False
+    if out.get("source") != llm.AI or not str(out.get("text") or "").strip():
+        return ASSISTANT_DOWN, False
+    return str(out["text"]).strip(), True
 
 
 # --- customer message ---------------------------------------------------------
@@ -604,7 +678,8 @@ class Bot:
     def on_text(self, text):
         waiting = self.waiting.pop(self.admin, None)
         if text in ("/start", "/help"):
-            self.say("Ράφι · Telegram. Στείλε /brief για την πρωινή ενημέρωση.")
+            self.say("Ράφι · Telegram. Στείλε /brief για την πρωινή ενημέρωση. "
+                     + esc(ASK_HINT))
         elif text == "/brief":
             send_brief(self.api, self.cfg, self.db)
         elif waiting and waiting[0] == "ask":
@@ -613,8 +688,16 @@ class Bot:
             self.reject(waiting[1], h.rejection_text(OTHER, text))
         elif waiting and waiting[0] == "preject":
             self.reject_purchase(waiting[1], waiting[2], h.rejection_text(OTHER, text))
+        elif text and not text.startswith("/"):
+            self.general_question(text)
         else:
-            self.say("Στείλε /brief για την πρωινή ενημέρωση ή διάλεξε από τα κουμπιά.")
+            self.say("Στείλε /brief για την πρωινή ενημέρωση, γράψε μια ερώτηση "
+                     "ή διάλεξε από τα κουμπιά.")
+
+    def general_question(self, question):
+        """A free question of the Administrator, answered from the morning numbers."""
+        text, ai = answer_question(question, self.db)
+        self.say(esc(text) + (f"\n<i>({h.AI_BADGE})</i>" if ai else ""))
 
     # -- buttons --
 
