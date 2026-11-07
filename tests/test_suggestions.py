@@ -1,5 +1,6 @@
 """Suggestions built from the real forecast (cutoff 2026-10-31, today 2026-11-01)."""
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -8,8 +9,8 @@ import pytest
 from rafi.features import route_days, winter_history, working_day
 from rafi.forecast import forecast
 from rafi.ingest import build_deliveries, daily_qty, load_from_files
-from rafi.suggestions import (EXTRA_ROUTE, LOSS, OFFER, ORDER, URGENT, build_suggestions,
-                              delivery_plan, load_promos)
+from rafi.suggestions import (EXTRA_ROUTE, EXTRA_ROUTE_COST_EUR, LOSS, MARGINAL, OFFER, ORDER,
+                              URGENT, build_suggestions, delivery_plan, load_promos)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -55,13 +56,15 @@ def test_delivery_is_a_working_day_from_tomorrow(suggestions):
         assert s["payload"]["SUGGESTED_DELIVERY_DATE"] == s["DELIVERY_DATE"]
 
 
-def test_order_delivery_before_every_depletion_unless_urgent(suggestions):
+def test_order_delivery_before_every_depletion_unless_urgent_or_marginal(suggestions):
     orders = _of(suggestions, ORDER)
     assert orders
     for s in orders:
         d = pd.Timestamp(s["DELIVERY_DATE"])
         if URGENT in s["FLAGS"]:
             assert d == FIRST_DAY
+        elif MARGINAL in s["FLAGS"]:
+            assert d == pd.Timestamp(s["FACTS"]["usual_visit"])  # waits for the usual visit
         else:
             assert all(d < _dep(l) for l in s["payload"]["LINES"]), s["TRDR"]
 
@@ -78,6 +81,36 @@ def test_order_on_route_day_when_one_exists_before_depletion(suggestions, data):
         else:
             assert (EXTRA_ROUTE in s["FLAGS"]
                     or pd.Timestamp(s["DELIVERY_DATE"]).weekday() in days)
+
+
+def test_small_lost_sales_wait_for_the_route_large_ones_get_an_extra_run():
+    wed, dep = [2], pd.Timestamp("2026-11-02")
+    d, d1, _, flags = delivery_plan(dep, wed, TODAY, lost_eur=EXTRA_ROUTE_COST_EUR - 1)
+    assert d == d1 == pd.Timestamp("2026-11-04") and flags == [MARGINAL]
+    d, _, _, flags = delivery_plan(dep, wed, TODAY, lost_eur=EXTRA_ROUTE_COST_EUR)
+    assert d == FIRST_DAY and URGENT in flags and MARGINAL not in flags
+    d, _, _, flags = delivery_plan(pd.Timestamp("2026-11-04"), wed, TODAY, lost_eur=500)
+    assert d == pd.Timestamp("2026-11-03") and flags == [EXTRA_ROUTE]
+
+
+def test_lost_sales_decide_between_route_and_extra_run(suggestions):
+    for s in _of(suggestions, ORDER):
+        lost, p = s["FACTS"]["lost_eur"], s["payload"]
+        assert p["LOST_EUR"] == lost and lost >= 0
+        usual = pd.Timestamp(s["FACTS"]["usual_visit"])
+        earliest = min(_dep(l) for l in p["LINES"])
+        if earliest > usual:
+            assert not s["FLAGS"] and lost == 0
+        elif lost < EXTRA_ROUTE_COST_EUR:
+            assert s["FLAGS"] == [MARGINAL]
+            assert "λιγότερες από το κόστος έκτακτου δρομολογίου" in p["REASON"]
+            assert "επιβεβαιώσετε" in p["SALES_NOTE"]
+        else:
+            assert MARGINAL not in s["FLAGS"]
+            assert URGENT in s["FLAGS"] or EXTRA_ROUTE in s["FLAGS"]
+            assert "περισσότερες από το κόστος έκτακτου δρομολογίου" in p["REASON"]
+    flags = {f for s in suggestions for f in s["FLAGS"]}
+    assert {MARGINAL, URGENT, EXTRA_ROUTE} <= flags
 
 
 def test_order_lines_run_out_before_the_next_visit(suggestions):
@@ -138,10 +171,21 @@ def test_payload_matches_the_erp_format(suggestions):
         assert s["VALUE_EUR"] == round(sum(l["QTY1"] * l["PRICER"] for l in p["LINES"]), 2)
 
 
-def test_priority_urgent_first(suggestions):
+def test_priority_urgent_then_loss_then_orders_then_offers(suggestions):
     assert [s["PRIORITY"] for s in suggestions] == list(range(1, len(suggestions) + 1))
-    urgent = [URGENT in s["FLAGS"] for s in suggestions]
-    assert urgent == sorted(urgent, reverse=True)
+
+    def group(s):
+        if URGENT in s["FLAGS"]:
+            return 0
+        return {LOSS: 1, ORDER: 2, OFFER: 3}[s["ACTION_TYPE"]]
+    groups = [group(s) for s in suggestions]
+    assert groups == sorted(groups)
+    assert set(groups) == {0, 1, 2, 3}
+    loss_values = [s["FACTS"]["purchases_12m_eur"] for s in _of(suggestions, LOSS)]
+    assert loss_values == sorted(loss_values, reverse=True)
+    orders = [s for s in suggestions if group(s) == 2]
+    deps = [pd.Timestamp(s["EARLIEST_DEPLETION"]) for s in orders]
+    assert deps == sorted(deps)
 
 
 # --- winter closures and loss risk -----------------------------------------
@@ -157,6 +201,11 @@ def test_1127_is_a_loss_risk(suggestions):
     assert 1127 in loss
     assert loss[1127]["FACTS"]["last_delivery"] == "2026-08-17"
     assert loss[1127]["FACTS"]["days_early"] > 30
+    # basket in season: August orders, November delivery in Crete -> much smaller quantities
+    for fl, line in zip(loss[1127]["FACTS"]["lines"], loss[1127]["payload"]["LINES"]):
+        assert fl["season_scale"] < 1
+        assert line["QTY1"] == max(1, math.ceil(fl["median_qty"] * fl["season_scale"] - 1e-9))
+        assert line["QTY1"] < fl["median_qty"]
     assert 1127 not in {s["TRDR"] for s in suggestions if s["ACTION_TYPE"] != LOSS}
 
 
@@ -178,11 +227,15 @@ def test_seasonal_offers(suggestions, data):
     for s in offers:
         assert s["TRDR"] not in closed
         assert pd.Timestamp(s["DELIVERY_DATE"]) >= pd.Timestamp("2026-11-20")
-        for l in s["payload"]["LINES"]:
+        for l, fl in zip(s["payload"]["LINES"], s["FACTS"]["lines"]):
             assert l["MTRL"] in seasonal
             bought = p[(p["TRDR"] == s["TRDR"]) & (p["MTRL"] == l["MTRL"])
                        & (p["TRNDATE"].dt.year == 2025)]
-            assert bought["QTY"].sum() == l["QTY1"]
+            assert bought["QTY"].sum() == fl["last_year_total"]  # net of returns, in REASON
+            first = bought[bought["QTY"] > 0].sort_values("TRNDATE")
+            first = first[first["TRNDATE"] == first["TRNDATE"].iloc[0]]
+            assert l["QTY1"] == first["QTY"].sum()  # quantity of last year's first delivery
+            assert str(fl["last_year_total"]) in s["payload"]["REASON"]
 
 
 def test_promo_on_delivery_day_is_marked(data):
