@@ -152,9 +152,17 @@ def user_label(user, salesmen=None):
     return u
 
 
-def store_user(s):
-    """User recorded in the store for actions from the dashboard."""
-    return str(s.get("salesman") or "admin")
+ADMIN = "admin"  # the dashboard has one user for now; shown as «Διαχειριστής»
+
+
+def store_user(s=None):
+    """User recorded in the store for every action from the dashboard."""
+    return ADMIN
+
+
+def is_ai(source):
+    """True only for text written by the assistant (source or TEXT_SOURCE equal to "AI")."""
+    return source == "AI"
 
 
 # --- tabs and home page ------------------------------------------------------
@@ -229,13 +237,45 @@ def item_lookup(items):
 
 
 def lines_rows(s, items_map):
-    """Rows of the items table of one suggestion."""
+    """Rows of the items table of one suggestion, with real values (int, Timestamp or None).
+
+    Earliest depletion first; lines without a date at the end.
+    """
     rows = []
     for l in s["payload"]["LINES"]:
         name, unit = items_map.get(int(l["MTRL"]), (l.get("ITEM_NAME") or str(l["MTRL"]), ""))
         rows.append({"Είδος": name, "Ποσότητα": int(l["QTY1"]), "Μονάδα": unit,
-                     "Προβλεπόμενη εξάντληση": fmt_date(l.get("PREDICTED_DEPLETION_DATE"))})
-    return rows
+                     "Τελειώνει": _to_date(l.get("PREDICTED_DEPLETION_DATE"))})
+    return sorted(rows, key=lambda r: (r["Τελειώνει"] is None, r["Τελειώνει"] or 0))
+
+
+def lines_frame(rows):
+    """DataFrame of lines_rows: the quantity keeps its unit in the display only."""
+    df = pd.DataFrame(rows, columns=["Είδος", "Ποσότητα", "Μονάδα", "Τελειώνει"])
+    df["Ποσότητα"] = df["Ποσότητα"].astype("int64")
+    df["Τελειώνει"] = pd.to_datetime(df["Τελειώνει"])
+    return df
+
+
+def fmt_day(d):
+    """'2026-11-02' -> 'Δευτ. 02/11' (short, for tables and cards). Empty -> '—'."""
+    t = _to_date(d)
+    return "—" if t is None else f"{WEEKDAYS_SHORT[t.weekday()]} {t:%d/%m}"
+
+
+# Display formats of the tables: the data stay numbers and dates (so sorting is right),
+# only what is shown is Greek.
+TABLE_FORMATS = {
+    "Ποσότητα": lambda x: fmt_qty(x),
+    "Αξία": lambda x: fmt_eur(x),
+    "Τελειώνει": lambda x: fmt_day(x),
+    "Ημερομηνία": lambda x: fmt_datetime(x),
+}
+
+
+def table_formats(df):
+    """{column: function} for the columns of df that have a Greek display format."""
+    return {c: f for c, f in TABLE_FORMATS.items() if c in df.columns}
 
 
 def changed_quantities(lines, new_values):
@@ -321,7 +361,7 @@ def history_rows(entries, customers_map=None, items_map=None, salesmen=None):
     rows = []
     for h in sorted(entries, key=lambda h: h["id"], reverse=True):
         name, code = customers_map.get(int(h["trdr"]), (str(h["trdr"]), ""))
-        rows.append({"Ημερομηνία": fmt_datetime(h["at"]), "Πελάτης": name, "Κωδικός": code,
+        rows.append({"Ημερομηνία": pd.Timestamp(h["at"]), "Πελάτης": name, "Κωδικός": code,
                      "Τύπος": label(h["action_type"]), "Κίνηση": label(h["action"]),
                      "Λεπτομέρειες": history_details(h, items_map),
                      "Χρήστης": user_label(h["user"], salesmen), "_trdr": int(h["trdr"])})
@@ -336,7 +376,8 @@ def ask_assistant(question, context):
     source is None when the text did not come from the assistant.
     """
     try:
-        from rafi import llm
+        import importlib
+        llm = importlib.import_module("rafi.llm")
         out = llm.answer(question, context)
         text = out.get("text") if isinstance(out, dict) else None
         if not text or not str(text).strip():
@@ -383,8 +424,20 @@ def read_settings(path=None):
     return _settings.load_settings(path)
 
 
-def write_settings(extra_route_cost_eur, after_approval_mode, path=None):
-    """Save the two settings of the page; the other keys keep their values."""
+# Extra numbers of the settings page, shown only when the settings file has them:
+# {key: (label, step, whole number)}
+EXTRA_SETTINGS = {
+    "stock_cover_weeks": ("Εβδομάδες κάλυψης αποθήκης", 1.0, False),
+    "safety_weeks": ("Απόθεμα ασφαλείας, εβδομάδες", 0.5, False),
+    "ai_texts_top_n": ("Κείμενα AI για τις πρώτες N προτάσεις", 1, True),
+}
+
+
+def write_settings(extra_route_cost_eur, after_approval_mode, path=None, extra=None):
+    """Save the settings of the page; the other keys keep their values.
+
+    extra: {key: number} for the keys of EXTRA_SETTINGS (never negative; whole where asked).
+    """
     if after_approval_mode not in AFTER_APPROVAL_OPTIONS:
         raise ValueError(f"unknown mode {after_approval_mode}")
     cost = float(extra_route_cost_eur)
@@ -393,4 +446,207 @@ def write_settings(extra_route_cost_eur, after_approval_mode, path=None):
     current = _settings.load_settings(path)
     current.update(extra_route_cost_eur=int(cost) if cost.is_integer() else cost,
                    after_approval_mode=after_approval_mode)
+    for key, value in (extra or {}).items():
+        if key not in EXTRA_SETTINGS:
+            raise ValueError(f"unknown setting {key}")
+        label_, _, whole = EXTRA_SETTINGS[key]
+        v = float(value)
+        if v < 0 or (whole and not v.is_integer()):
+            raise ValueError(f"Μη έγκυρη τιμή για «{label_}».")
+        current[key] = int(v) if v.is_integer() else v
     return _settings.save_settings(current, path)
+
+
+# --- cards (Πελάτες and Αρχική) ------------------------------------------------
+
+WAREHOUSE_SHORTAGE = "ΕΛΛΕΙΨΗ_ΑΠΟΘΗΚΗΣ"
+LABELS[WAREHOUSE_SHORTAGE] = "Έλλειψη αποθήκης"
+DAY_ARTICLE = ["τη", "την", "την", "την", "την", "το", "την"]
+
+
+def caps(text):
+    """Greek capitals without accents, as on signs: 'Κίνδυνος απώλειας' -> 'ΚΙΝΔΥΝΟΣ ΑΠΩΛΕΙΑΣ'."""
+    import unicodedata
+    plain = "".join(c for c in unicodedata.normalize("NFD", str(text))
+                    if unicodedata.category(c) != "Mn")
+    return unicodedata.normalize("NFC", plain).upper()
+
+
+def dm(d):
+    """'2026-11-02' -> '2/11'."""
+    t = _to_date(d)
+    return "—" if t is None else f"{t.day}/{t.month}"
+
+
+def day_phrase(d):
+    """'2026-11-02' -> 'τη Δευτέρα 2/11'; '2026-11-07' -> 'το Σάββατο 7/11'."""
+    t = _to_date(d)
+    return "—" if t is None else f"{DAY_ARTICLE[t.weekday()]} {WEEKDAYS[t.weekday()]} {dm(t)}"
+
+
+def items_count(n):
+    return f"{n} είδος" if n == 1 else f"{n} είδη"
+
+
+def card_badge(s):
+    """(text, kind) of the one mark a card shows; kind picks the colour."""
+    flags = set(s["payload"].get("FLAGS", []))
+    kind = s["action_type"]
+    if kind == LOSS:
+        return "Κίνδυνος απώλειας", "loss"
+    if kind == OFFER:
+        return "Προσφορά", "offer"
+    if URGENT in flags and EXTRA_ROUTE in flags:
+        return "Επείγον · Έκτακτο", "urgent"
+    if EXTRA_ROUTE in flags:
+        return "Έκτακτο", "urgent"
+    if URGENT in flags:
+        return "Επείγον", "urgent"
+    if MARGINAL in flags:
+        return "Οριακό · τηλεφώνημα", "call"
+    return "Παραγγελία", "order"
+
+
+def facts_by_suggestion(entries):
+    """{suggestion id: facts} from the ΔΗΜΙΟΥΡΓΙΑ entries of the history."""
+    out = {}
+    for e in entries:
+        d = e.get("details") or {}
+        if e.get("action") == "ΔΗΜΙΟΥΡΓΙΑ" and isinstance(d, dict) and d.get("facts"):
+            out[int(e["suggestion_id"])] = d["facts"]
+    return out
+
+
+def card_line(s, facts=None):
+    """One short human line under the customer's name on a card."""
+    facts = facts or {}
+    flags = set(s["payload"].get("FLAGS", []))
+    n = items_count(len(s["payload"].get("LINES", [])))
+    value = fmt_eur(s["value_eur"])
+    when = day_phrase(s["delivery_date"])
+    kind = s["action_type"]
+    if kind == LOSS:
+        if facts.get("days_early"):
+            return f"Σταμάτησε {facts['days_early']} ημέρες νωρίς · τηλεφώνημα σήμερα"
+        if facts.get("days_silent"):
+            return (f"Καμία παραγγελία εδώ και {facts['days_silent']} ημέρες, πέρα από το "
+                    f"συνηθισμένο · τηλεφώνημα")
+        return "Σιωπή πέρα από το συνηθισμένο · τηλεφώνημα"
+    if kind == OFFER:
+        return f"Εποχικά είδη · παράδοση {when} · {n} · {value}"
+    if EXTRA_ROUTE in flags:
+        return f"Έκτακτο δρομολόγιο {when} · {n} · {value}"
+    if URGENT in flags:
+        return f"Επείγουσα παράδοση {when} · {n} · {value}"
+    if MARGINAL in flags:
+        return f"Κανονική επίσκεψη {when} · τηλεφώνημα πρώτα · {n} · {value}"
+    return f"Παράδοση {when} · {n} · {value}"
+
+
+def name_with_article(name):
+    """'Ταβέρνα Η Αυλή' -> 'Η Ταβέρνα Η Αυλή'; most shop names take 'Το'."""
+    feminine = ("Ταβέρνα", "Καφετέρια", "Πιτσαρία", "Ψαροταβέρνα")
+    return f"{'Η' if str(name).startswith(feminine) else 'Το'} {name}"
+
+
+def home_sentence(s, name, code, facts=None, route_cost=60):
+    """HTML sentence of the home list 'Χρειάζονται εσένα σήμερα' (customers)."""
+    import html as _html
+    facts = facts or {}
+    who = f"<b>{_html.escape(name)} ({_html.escape(str(code))})</b>"
+    flags = set(s["payload"].get("FLAGS", []))
+    n = items_count(len(s["payload"].get("LINES", [])))
+    value = fmt_eur(s["value_eur"])
+    when = day_phrase(s["delivery_date"])
+    article = name_with_article(name).split(" ")[0]
+    if s["action_type"] == LOSS:
+        if facts.get("days_early"):
+            yearly = (f", με {fmt_num(facts['purchases_12m_eur'])} € αγορές τον χρόνο"
+                      if facts.get("purchases_12m_eur") else "")
+            t = _to_date(s["delivery_date"])
+            return (f"{article} {who} σταμάτησε {facts['days_early']} ημέρες νωρίτερα από το "
+                    f"συνηθισμένο του κλείσιμο{yearly}. Τηλεφώνημα σήμερα και παραγγελία "
+                    f"επαναλειτουργίας για {t.day}/{t.month}/{t.year}.")
+        return (f"{article} {who} σταμάτησε να παραγγέλνει απρόσμενα. Τηλεφώνημα και "
+                f"παραγγελία {n} ({value}) για {WEEKDAYS[_to_date(s['delivery_date']).weekday()]} "
+                f"{dm(s['delivery_date'])}.")
+    if EXTRA_ROUTE in flags:
+        return (f"Προτείνουμε <b>έκτακτο δρομολόγιο {when}</b> για {article.lower()} {who}: "
+                f"{n}, {value}. Μέχρι την κανονική επίσκεψη θα χάνονταν πωλήσεις πάνω από τα "
+                f"{fmt_num(route_cost)} € του δρομολογίου.")
+    return (f"{article} {who} χρειάζεται παράδοση <b>{when}</b>: {n}, {value}.")
+
+
+def warehouse_shortage(s, items_map=None):
+    """Names of the items of a suggestion that the warehouse may not have in time.
+
+    The mark is ΕΛΛΕΙΨΗ_ΑΠΟΘΗΚΗΣ, on the suggestion (FLAGS) or on single lines (FLAGS of the
+    line). Returns None when there is no such mark, else a list of item names (may be empty).
+    """
+    items_map = items_map or {}
+    p = s["payload"]
+    lines = [l for l in p.get("LINES", []) if WAREHOUSE_SHORTAGE in (l.get("FLAGS") or [])]
+    if not lines and WAREHOUSE_SHORTAGE not in p.get("FLAGS", []):
+        return None
+    return [items_map.get(int(l["MTRL"]), (l.get("ITEM_NAME") or str(l["MTRL"]), ""))[0]
+            for l in lines]
+
+
+MONTHS_GEN = ["Ιανουαρίου", "Φεβρουαρίου", "Μαρτίου", "Απριλίου", "Μαΐου", "Ιουνίου", "Ιουλίου",
+              "Αυγούστου", "Σεπτεμβρίου", "Οκτωβρίου", "Νοεμβρίου", "Δεκεμβρίου"]
+
+
+def fmt_sync(d):
+    """'2026-11-01T06:00:12' -> '01/11 06:00'."""
+    t = _to_date(d)
+    return "—" if t is None else f"{t:%d/%m %H:%M}"
+
+
+def fmt_date_words(d):
+    """'2026-11-01' -> 'Κυριακή 1 Νοεμβρίου 2026'."""
+    t = _to_date(d)
+    return "—" if t is None else f"{WEEKDAYS[t.weekday()]} {t.day} {MONTHS_GEN[t.month - 1]} {t.year}"
+
+
+def morning_texts():
+    """{"customers": text, "warehouse": text} from rafi.agents.orchestrator.morning_summary,
+    keeping only plain texts. {} while the coordinator is not there or fails."""
+    import importlib
+    try:
+        out = importlib.import_module("rafi.agents.orchestrator").morning_summary()
+    except Exception:
+        return {}
+    if not isinstance(out, dict):
+        return {}
+    texts = {}
+    for k in ("customers", "warehouse"):
+        v = out.get(k)
+        if isinstance(v, dict):
+            v = v.get("text") or v.get("summary")
+        if isinstance(v, str) and v.strip():
+            texts[k] = v.strip()
+    return texts
+
+
+MESSAGE_SENT = "Στάλθηκε και μήνυμα στον πελάτη."
+MESSAGE_NOT_SENT = "Το μήνυμα στον πελάτη δεν στάλθηκε."
+MESSAGE_NOT_READY = "Το μήνυμα στον πελάτη δεν στάλθηκε: η αποστολή μηνυμάτων δεν είναι ακόμα ενεργή."
+
+
+def notify_after_approval(suggestion_id, mode):
+    """After an approval: message the customer when the setting asks for it.
+
+    Returns None when no message is wanted, else (streamlit kind, text) for the page.
+    """
+    if mode != _settings.DRAFT_AND_MESSAGE:
+        return None
+    import importlib
+    try:
+        notify = importlib.import_module("rafi.telegram_bot").notify_customer
+    except Exception:
+        return ("warning", MESSAGE_NOT_READY)
+    try:
+        ok = bool(notify(int(suggestion_id)))
+    except Exception:
+        ok = False
+    return ("success", MESSAGE_SENT) if ok else ("warning", MESSAGE_NOT_SENT)

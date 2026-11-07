@@ -5,9 +5,8 @@ from app import helpers as h
 from app import ui
 from rafi import store
 
-st.title("Ιστορικό")
-st.markdown('<p class="ne-sub">Όλες οι κινήσεις: δημιουργία, διορθώσεις, εγκρίσεις, '
-            'απορρίψεις και αποστολές στο ERP</p>', unsafe_allow_html=True)
+ui.page_header("Ιστορικό", "", "Ιστορικό", "Όλες οι κινήσεις: δημιουργία, διορθώσεις, "
+               "εγκρίσεις, απορρίψεις και αποστολές στο ERP")
 
 rows = h.history_rows(store.history(), ui.customers_map(), ui.items_map(), ui.salesmen_map())
 if not rows:
@@ -27,6 +26,5 @@ shown = [r for r in rows
 st.markdown(f'<p class="ne-muted">{len(shown)} από {len(rows)} κινήσεις</p>',
             unsafe_allow_html=True)
 if shown:
-    st.dataframe(pd.DataFrame(shown).drop(columns="_trdr"), hide_index=True, width="stretch",
-                 height=min(38 + 35 * len(shown), 640),
-                 column_config={"Λεπτομέρειες": st.column_config.TextColumn(width="large")})
+    ui.table(pd.DataFrame(shown).drop(columns="_trdr"), height=min(38 + 35 * len(shown), 640),
+             column_config={"Λεπτομέρειες": st.column_config.TextColumn(width="large")})
