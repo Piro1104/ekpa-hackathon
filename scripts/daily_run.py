@@ -17,23 +17,29 @@ sys.path.insert(0, str(ROOT))
 
 from rafi import store  # noqa: E402
 from rafi.forecast import forecast  # noqa: E402
+from rafi.lgbm_engine import forecast_hybrid  # noqa: E402
 from rafi.ingest import build_deliveries, daily_qty, load_from_files  # noqa: E402
 from rafi.suggestions import (EXTRA_ROUTE, LOSS, MARGINAL, OFFER, ORDER, URGENT,  # noqa: E402
                               WEEKDAYS, build_suggestions, load_promos)
 
 TODAY = pd.Timestamp("2026-11-01")
 TOP = 10
+METHODS = {"hybrid": forecast_hybrid, "rafi": forecast}
+DEFAULT_METHOD = "hybrid"
 
 
-def run(today=TODAY, db=None, data_dir=ROOT / "data"):
-    """Compute and save today's suggestions. Returns (save result, customers, salesmen)."""
+def run(today=TODAY, db=None, data_dir=ROOT / "data", method=DEFAULT_METHOD):
+    """Compute and save today's suggestions. Returns (save result, customers, salesmen).
+
+    `method`: "hybrid" (rafi + LightGBM correction) or "rafi".
+    """
     today = pd.Timestamp(today)
     cutoff = today - pd.Timedelta(days=1)
     headers, lines, items, customers = load_from_files(data_dir)
     deliveries = build_deliveries(headers, lines, items)
     past = deliveries[deliveries["TRNDATE"] <= cutoff]
     targets = pd.read_csv(Path(data_dir) / "prediction_targets.csv", encoding="utf-8-sig")
-    details = forecast(daily_qty(past), past, customers, items, targets, cutoff)
+    details = METHODS[method](daily_qty(past), past, customers, items, targets, cutoff)
     suggestions = build_suggestions(details, customers, items, past, load_promos(data_dir), today)
     result = store.save_new(suggestions, user="system", db=db)
     salesmen = pd.read_csv(Path(data_dir) / "PRSN.csv", encoding="utf-8-sig")
@@ -79,8 +85,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Καθημερινός υπολογισμός προτάσεων του Ράφι.")
     ap.add_argument("--today", default=str(TODAY.date()))
     ap.add_argument("--db", default=None)
+    ap.add_argument("--method", choices=list(METHODS), default=DEFAULT_METHOD)
     args = ap.parse_args(argv)
-    result, customers, salesmen = run(args.today, db=args.db)
+    result, customers, salesmen = run(args.today, db=args.db, method=args.method)
     print(briefing(result, customers, salesmen, args.today, db=args.db))
     return result
 

@@ -23,12 +23,23 @@ def _rafi(k=K_DELIVERIES, **switches):
     return method
 
 
+def _hybrid(blend_weight=0.55):
+    """rafi + LightGBM correction (rafi.lgbm_engine); imported here so the rest of
+    evaluate works without lightgbm installed."""
+    def method(daily, targets, cutoff, deliveries, customers, items, **_):
+        from rafi.lgbm_engine import forecast_hybrid
+        return forecast_hybrid(daily, deliveries, customers, items, targets, cutoff,
+                               blend_weight=blend_weight)
+    return method
+
+
 # Every method has the same signature: (daily, targets, cutoff, **ctx) -> predictions.
 # ctx holds deliveries, customers and items (all cut at the cutoff); baselines ignore it.
 METHODS = {
     "plus30": lambda daily, targets, cutoff, **_: plus30(targets, cutoff),
     "rolling180": lambda daily, targets, cutoff, **_: rolling180(daily, targets, cutoff),
     "rafi": _rafi(),
+    "hybrid": _hybrid(),
 }
 
 # Ablation: each row adds one step to the one before; the last row is a rejected experiment.
@@ -42,6 +53,7 @@ ABLATION = {
     "+ cold start": _rafi(factors_without_closers=False, split_closer_factors=False),
     "+ χωριστοί συντελ. closers": _rafi(factors_without_closers=False,
                                          split_closer_factors=True),
+    "+ διόρθωση LightGBM (hybrid)": METHODS["hybrid"],
     # Rejected idea: lower MAE on 2025-10-31 but higher on 2026-06-30.
     "(δοκιμή) συντελ. χωρίς κλεισίματα": _rafi(factors_without_closers=True,
                                                split_closer_factors=False),
@@ -238,18 +250,25 @@ def _table(rows):
 
 
 def main():
+    results = {}  # the hybrid trains a model; run each (method, cutoff) only once
+
+    def run(fn, c):
+        if (fn, c) not in results:
+            results[fn, c] = backtest(fn, c)
+        return results[fn, c]
+
     print("Ράφι · backtest με «αλήθεια» = επόμενη πραγματική παράδοση (προσέγγιση)")
     print(f"{'Μέθοδος':<11} {'Cutoff':<10} {'n':>5} {'MAE':>6} {'±3':>5} {'±7':>5} "
           f"{'Precision':>9} {'Recall':>6}")
     for m in METHODS:
         for c in CUTOFFS:
-            k = backtest(m, c)["metrics"]
+            k = run(METHODS[m], c)["metrics"]
             print(f"{m:<11} {c:<10} {k['n']:>5} {k['MAE']:>6.1f} {_pct(k['within_3']):>5} "
                   f"{_pct(k['within_7']):>5} {_pct(k['precision']):>9} {_pct(k['recall']):>6}")
 
     for c in CUTOFFS:
         print(f"\nABLATION · cutoff {c} (κάθε γραμμή προσθέτει ένα βήμα· MAE σε ημέρες)")
-        print(_table({name: _row(backtest(fn, c)) for name, fn in ABLATION.items()}))
+        print(_table({name: _row(run(fn, c)) for name, fn in ABLATION.items()}))
 
     print("\nΔοκιμή k (πλήθος πρόσφατων παραδόσεων για τον ρυθμό) · MAE")
     rows = {}
