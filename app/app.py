@@ -16,6 +16,7 @@ if "app" in sys.modules and not hasattr(sys.modules["app"], "__path__"):
 
 import streamlit as st  # noqa: E402
 
+from app import helpers as h  # noqa: E402
 from app import ui  # noqa: E402
 
 st.set_page_config(page_title="Never Empty", page_icon=ui.page_icon(), layout="wide",
@@ -25,14 +26,23 @@ ui.inject_css()
 PAGES = {
     "home": st.Page("views/home.py", title="Αρχική", url_path="arxiki", default=True),
     "customers": st.Page("views/customers.py", title="Πελάτες", url_path="pelates"),
+    "warehouse": st.Page("views/warehouse_page.py", title="Αποθήκη", url_path="apothiki"),
     "history": st.Page("views/history.py", title="Ιστορικό", url_path="istoriko"),
     "settings": st.Page("views/settings_page.py", title="Ρυθμίσεις", url_path="rythmiseis"),
 }
 current = st.navigation(list(PAGES.values()), position="hidden")
 
+# small counters in the menu: proposals waiting, and purchase orders of the week
+pending = sum(1 for s in ui.all_suggestions() if s["status"] == h.PROPOSED)
+week = ui.warehouse_orders()
+counts = {"customers": pending, "warehouse": None if week is None else len(week)}
+
 with st.sidebar:
     ui.sidebar_logo()
-    for page in PAGES.values():
-        st.page_link(page, label=page.title, width="stretch")
+    for key, page in PAGES.items():
+        n = counts.get(key)
+        label = f"{page.title} `{n}`" if n is not None else page.title
+        st.page_link(page, label=label, width="stretch")
+    ui.sidebar_footer()
 
 current.run()

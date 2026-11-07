@@ -1,7 +1,3 @@
-import html
-from functools import partial
-
-import pandas as pd
 import streamlit as st
 
 from app import helpers as h
@@ -10,167 +6,217 @@ from rafi import store
 from rafi.erp_client import ErpError
 from rafi.store import StoreError
 
-st.title("Πελάτες")
-st.markdown('<p class="ne-sub">Προτάσεις προς έγκριση, με τη σειρά προτεραιότητας</p>',
-            unsafe_allow_html=True)
+SHOWN_LINES = 5   # rows of the items table before «+N ακόμη»
+PAGE_CARDS = 30   # cards shown before «Δείξε περισσότερες»
+
+ui.page_header("Πελάτες", "", "Πελάτες", "Κάθε πρόταση σε απλά λόγια: τι προτείνουμε και γιατί")
 
 suggestions = ui.all_suggestions()
 if ui.empty_state(suggestions):
     st.stop()
 
+tabs = h.split_tabs(suggestions)
+facts = ui.facts()
+state = st.session_state
 
-def _select(table_key, ids):
-    rows = st.session_state[table_key].selection.rows
-    if rows:
-        st.session_state["selected_id"] = ids[rows[0]]
+selected = None
+if state.get("selected_id") is not None:
+    try:
+        selected = store.get(state["selected_id"])
+    except StoreError:
+        state.pop("selected_id")
+
+# the tab follows the selected suggestion when it comes from the home page
+if selected is not None and h.tab_of(selected) and selected["status"] == store.PROPOSED \
+        and state.get("cust_tab_for") != selected["id"]:
+    state["cust_tab"] = h.tab_of(selected)
+    state["cust_tab_for"] = selected["id"]
+tab = state.get("cust_tab", h.TAB_NEEDS_YOU)
+rows = tabs[tab]
+if selected is None and rows:
+    selected = rows[0]
+    state["selected_id"] = selected["id"]
 
 
-def _table(tab, rows):
+def pick_tab(t):
+    state["cust_tab"] = t
+    state["cust_shown"] = PAGE_CARDS
+    state["cust_tab_for"] = None
+    if tabs[t]:
+        state["selected_id"] = tabs[t][0]["id"]
+
+
+def pick(sid):
+    state["selected_id"] = sid
+    state["cust_tab_for"] = sid
+    state.pop("cust_action", None)
+
+
+with st.container(horizontal=True, key="ne_tabs"):
+    for t in h.TABS:
+        st.button(f"{t} ({len(tabs[t])})", key=f"tab_{h.TABS.index(t)}",
+                  type="primary" if t == tab else "secondary", on_click=pick_tab, args=(t,))
+
+left, right = st.columns([5, 7], gap="medium")
+
+# --- cards -------------------------------------------------------------------------
+
+with left, st.container(key="ne_list"):
     if not rows:
         st.markdown('<p class="ne-muted">Καμία πρόταση σε αυτή την καρτέλα.</p>',
                     unsafe_allow_html=True)
-        return
-    data = []
-    for s in rows:
-        name, code = ui.customer(s["trdr"])
-        data.append({"Πελάτης": name, "Κωδικός": code,
-                     "Παράδοση": h.fmt_date(s["delivery_date"]),
-                     "Αξία": h.fmt_eur(s["value_eur"]),
-                     "Σήμανση": " · ".join(h.flag_labels(s)),
-                     "Περίληψη": h.summary(s, 110)})
-    key = f"table_{tab}"
-    ids = [s["id"] for s in rows]
-    st.dataframe(
-        pd.DataFrame(data), key=key, hide_index=True, width="stretch",
-        height=min(38 + 35 * len(data), 330),
-        on_select=partial(_select, key, ids), selection_mode="single-row",
-        column_config={"Περίληψη": st.column_config.TextColumn(width="large"),
-                       "Σήμανση": st.column_config.TextColumn(width="medium")})
+    shown = state.get("cust_shown", PAGE_CARDS)
+    for s in rows[:shown]:
+        name, _ = ui.customer(s["trdr"])
+        text, kind = h.card_badge(s)
+        ui.card(s["id"], ui.tag(text, kind), name, s["trdr"], h.card_line(s, facts.get(s["id"])),
+                selected is not None and s["id"] == selected["id"], pick, (s["id"],))
+    if len(rows) > shown:
+        if st.button(f"Δείξε περισσότερες ({len(rows) - shown} ακόμη)", type="tertiary"):
+            state["cust_shown"] = shown + PAGE_CARDS
+            st.rerun()
+    st.markdown('<p class="ne-muted">Σειρά: επείγοντα → κίνδυνος απώλειας → παραγγελίες → '
+                'προσφορές.</p>', unsafe_allow_html=True)
 
+# --- one suggestion -------------------------------------------------------------------
 
-tabs = h.split_tabs(suggestions)
-selected = None
-if st.session_state.get("selected_id") is not None:
-    try:
-        selected = store.get(st.session_state["selected_id"])
-    except StoreError:
-        st.session_state.pop("selected_id")
+with right:
+    if selected is None:
+        st.markdown('<p class="ne-muted">Διάλεξε μια κάρτα για να δεις την πρόταση.</p>',
+                    unsafe_allow_html=True)
+        st.stop()
 
-titles = {t: f"{t} ({len(tabs[t])})" for t in h.TABS}
-default = titles.get(h.tab_of(selected)) if selected else None
-containers = st.tabs([titles[t] for t in h.TABS], default=default)
-for tab, box in zip(h.TABS, containers):
-    with box:
-        _table(tab, tabs[tab])
-
-st.divider()
-
-if selected is None:
-    st.markdown('<p class="ne-muted">Επίλεξε μια γραμμή από τη λίστα για να δεις την πρόταση.</p>',
-                unsafe_allow_html=True)
-    st.stop()
-
-# --- one suggestion -------------------------------------------------------------
-
-s = selected
-sid, p = s["id"], s["payload"]
-name, code = ui.customer(s["trdr"])
-user = h.store_user()
-active = s["status"] == store.PROPOSED
-ai_text = h.is_ai(p.get("TEXT_SOURCE"))
-
-st.subheader(name)
-st.markdown(f'<span class="ne-muted">{html.escape(code)}</span> &nbsp; '
-            f'{ui.badge(h.label(s["action_type"]))}{ui.flag_badges(s)}'
-            f'{ui.badge(h.label(s["status"]))}', unsafe_allow_html=True)
-
-c1, c2, c3, c4 = st.columns(4)
-for col, value, text in [(c1, h.fmt_date(s["delivery_date"]), "παράδοση"),
-                         (c2, h.fmt_eur(s["value_eur"]), "αξία"),
-                         (c3, str(len(p["LINES"])), "είδη"),
-                         (c4, ui.salesmen_map().get(s["salesman"], "—"), "πωλητής")]:
-    col.markdown(f'<div class="ne-kpi"><div class="v">{html.escape(str(value))}</div>'
-                 f'<div class="l">{text}</div></div>', unsafe_allow_html=True)
-
-mark = ui.ai_badge() if ai_text else ""
-st.markdown(f"**Γιατί** {mark}", unsafe_allow_html=True)
-st.write(p.get("REASON") or "—")
-st.markdown(f"**Κείμενο για τον πελάτη** {mark}", unsafe_allow_html=True)
-st.markdown(f'<div class="ne-note">{html.escape(p.get("SALES_NOTE") or "—")}</div>',
-            unsafe_allow_html=True)
-
-st.markdown("**Είδη**")
-ui.table(h.lines_frame(h.lines_rows(s, ui.items_map())), height=38 + 35 * len(p["LINES"]))
-
-# --- decisions -------------------------------------------------------------------
-
-st.markdown("**Απόφαση**")
-ui.show_flash(f"s{sid}")
-if s["status"] == store.SENT:
-    st.success(f"Στάλθηκε στο ERP ως πρόχειρη · αριθμός {s['erp_id']}")
-elif s["status"] == store.REJECTED:
-    reasons = [x["details"]["reason"] for x in store.history(suggestion_id=sid)
-               if x["action"] == store.REJECT and x["details"]]
-    st.info("Η πρόταση απορρίφθηκε" + (f": {reasons[-1]}" if reasons else "."))
-elif s["status"] == store.SENDING:
-    st.warning("Η πρόταση στέλνεται αυτή τη στιγμή στο ERP.")
-
-if st.button("Εγκρίνω", type="primary", disabled=not active, key=f"approve_{sid}"):
-    try:
-        with st.spinner("Αποστολή στο ERP..."):
-            store.approve_and_send(sid, user)
-        st.rerun()
-    except ErpError as e:
-        kind = h.erp_error_kind(e)
-        if kind == "down":
-            st.error("Το ERP δεν απαντά. Ξεκίνα τον mock ERP: python mock_erp_server.py")
-        elif kind == "rejected":
-            st.error(f"Το ERP απέρριψε την πρόχειρη: {h.erp_rejection_message(e)}")
-        else:
-            st.error(str(e))
-    except StoreError as e:
-        st.warning(h.humanize(e))
-
-with st.expander("Διορθώνω ποσότητες", expanded=False):
+    s = selected
+    sid, p = s["id"], s["payload"]
+    name, _ = ui.customer(s["trdr"])
+    user = h.store_user()
+    active = s["status"] == store.PROPOSED
+    ai_text = h.is_ai(p.get("TEXT_SOURCE"))
     items = ui.items_map()
-    with st.form(f"correct_{sid}", border=False):
-        values = {}
-        for line in p["LINES"]:
-            mtrl = int(line["MTRL"])
-            item, unit = items.get(mtrl, (line.get("ITEM_NAME") or str(mtrl), ""))
-            values[mtrl] = st.number_input(f"{item} ({unit})" if unit else item, min_value=1,
-                                           step=1, value=int(line["QTY1"]), format="%d",
-                                           key=f"qty_{sid}_{mtrl}", disabled=not active)
-        save = st.form_submit_button("Αποθήκευση διορθώσεων", disabled=not active)
-    if save:
-        try:
-            changes = h.changed_quantities(p["LINES"], values)
-            for mtrl, qty in changes:
-                store.correct(sid, mtrl, qty, user)
-            if changes:
-                text = ("Αποθηκεύτηκε 1 διόρθωση." if len(changes) == 1
-                        else f"Αποθηκεύτηκαν {len(changes)} διορθώσεις.")
-                ui.flash(f"s{sid}", "success", text)
-            else:
-                ui.flash(f"s{sid}", "info", "Καμία ποσότητα δεν άλλαξε.")
-            st.rerun()
-        except (ValueError, StoreError) as e:
-            st.error(h.humanize(e))
+    text, kind = h.card_badge(s)
 
-with st.expander("Απορρίπτω", expanded=False):
-    with st.form(f"reject_{sid}", border=False):
-        reason = st.selectbox("Λόγος", h.REJECT_REASONS, index=None,
-                              placeholder="Διάλεξε λόγο", disabled=not active)
-        comment = st.text_input("Σχόλιο (προαιρετικό)", disabled=not active)
-        do_reject = st.form_submit_button("Απόρριψη πρότασης", disabled=not active)
-    if do_reject:
-        try:
-            store.reject(sid, h.rejection_text(reason, comment), user)
-            st.rerun()
-        except (ValueError, StoreError) as e:
-            st.error(h.humanize(e))
+    with st.container(key="ne_panel_customer"):
+        st.markdown(f'{ui.tag(text, kind)}<span class="ne-muted" style="font-size:.95rem">'
+                    f'Πελάτης {s["trdr"]}</span><div class="ne-title">{ui.esc(name)}</div>',
+                    unsafe_allow_html=True)
+        ui.numbers([("Παράδοση", h.fmt_day(s["delivery_date"])),
+                    ("Είδη", str(len(p["LINES"]))),
+                    ("Αξία", h.fmt_eur(s["value_eur"]))])
 
-st.markdown("**Ρώτα τον βοηθό για αυτή την πρόταση**")
-ui.chat_box(f"chat_s{sid}",
-            lambda: h.suggestion_context(store.get(sid), ui.customers_map(), ui.items_map()),
-            placeholder="π.χ. Γιατί προτείνεται παράδοση αυτή τη μέρα;")
+        ui.label_row("Τι προτείνουμε και γιατί", ai_text)
+        st.markdown(f'<div class="ne-reason">{ui.esc(p.get("REASON") or "—")}</div>',
+                    unsafe_allow_html=True)
+
+        short = h.warehouse_shortage(s, items)
+        if short is not None:
+            what = f": {', '.join(short)}" if short else ""
+            st.markdown(f'<div class="ne-warn"><b>Έλλειψη στην αποθήκη{ui.esc(what)}</b><br>'
+                        f'<span class="small">Μπορεί να μη φτάσει όλη η ποσότητα την ημέρα '
+                        f'της παράδοσης· δες την παραγγελία στον προμηθευτή.</span></div>',
+                        unsafe_allow_html=True)
+            st.page_link("views/warehouse_page.py", label="Άνοιγμα Αποθήκης →")
+
+        ui.label_row("Είδη")
+        lines = h.lines_rows(s, items)
+        all_lines = state.get(f"all_lines_{sid}", False)
+        visible = lines if all_lines else lines[:SHOWN_LINES]
+        ui.table(h.lines_frame(visible), height=38 + 35 * len(visible))
+        if len(lines) > SHOWN_LINES:
+            more = "Λιγότερα" if all_lines else f"+ {len(lines) - SHOWN_LINES} ακόμη είδη"
+            if st.button(more, key=f"more_{sid}", type="tertiary"):
+                state[f"all_lines_{sid}"] = not all_lines
+                st.rerun()
+
+        ui.label_row("Κείμενο για τον πελάτη", ai_text)
+        st.markdown(f'<div class="ne-note">{ui.esc(p.get("SALES_NOTE") or "—")}</div>',
+                    unsafe_allow_html=True)
+        st.write("")
+
+        # --- decisions ---------------------------------------------------------------
+        ui.show_flash(f"s{sid}")
+        if s["status"] == store.SENT:
+            st.success(f"Στάλθηκε στο ERP ως πρόχειρη · αριθμός {s['erp_id']}")
+        elif s["status"] == store.REJECTED:
+            reasons = [x["details"]["reason"] for x in store.history(suggestion_id=sid)
+                       if x["action"] == store.REJECT and x["details"]]
+            st.info("Η πρόταση απορρίφθηκε" + (f": {reasons[-1]}" if reasons else "."))
+        elif s["status"] == store.SENDING:
+            st.warning("Η πρόταση στέλνεται αυτή τη στιγμή στο ERP.")
+
+        action = state.get("cust_action") if active else None
+        with st.container(horizontal=True):
+            approve = st.button("Εγκρίνω · πρόχειρη στο ERP", type="primary", disabled=not active,
+                                key=f"approve_{sid}")
+            if st.button("Διορθώνω", disabled=not active, key=f"correct_btn_{sid}"):
+                state["cust_action"] = None if action == "correct" else "correct"
+                st.rerun()
+            if st.button("Απορρίπτω", disabled=not active, key=f"ne_reject_{sid}"):
+                state["cust_action"] = None if action == "reject" else "reject"
+                st.rerun()
+
+        if approve:
+            try:
+                with st.spinner("Αποστολή στο ERP..."):
+                    store.approve_and_send(sid, user)
+                note = h.notify_after_approval(sid, h.read_settings().get("after_approval_mode"))
+                if note:
+                    ui.flash(f"m{sid}", *note)
+                st.rerun()
+            except ErpError as e:
+                kind_ = h.erp_error_kind(e)
+                if kind_ == "down":
+                    st.error("Το ERP δεν απαντά. Ξεκίνα τον mock ERP: python mock_erp_server.py")
+                elif kind_ == "rejected":
+                    st.error(f"Το ERP απέρριψε την πρόχειρη: {h.erp_rejection_message(e)}")
+                else:
+                    st.error(str(e))
+            except StoreError as e:
+                st.warning(h.humanize(e))
+        ui.show_flash(f"m{sid}")
+
+        if action == "correct":
+            with st.form(f"correct_{sid}", border=True):
+                values = {}
+                for line in p["LINES"]:
+                    mtrl = int(line["MTRL"])
+                    item, unit = items.get(mtrl, (line.get("ITEM_NAME") or str(mtrl), ""))
+                    values[mtrl] = st.number_input(f"{item} ({unit})" if unit else item,
+                                                   min_value=1, step=1, value=int(line["QTY1"]),
+                                                   format="%d", key=f"qty_{sid}_{mtrl}")
+                save = st.form_submit_button("Αποθήκευση διορθώσεων", type="primary")
+            if save:
+                try:
+                    changes = h.changed_quantities(p["LINES"], values)
+                    for mtrl, qty in changes:
+                        store.correct(sid, mtrl, qty, user)
+                    if changes:
+                        msg = ("Αποθηκεύτηκε 1 διόρθωση." if len(changes) == 1
+                               else f"Αποθηκεύτηκαν {len(changes)} διορθώσεις.")
+                        ui.flash(f"s{sid}", "success", msg)
+                    else:
+                        ui.flash(f"s{sid}", "info", "Καμία ποσότητα δεν άλλαξε.")
+                    state.pop("cust_action", None)
+                    st.rerun()
+                except (ValueError, StoreError) as e:
+                    st.error(h.humanize(e))
+
+        if action == "reject":
+            with st.form(f"reject_{sid}", border=True):
+                reason = st.selectbox("Λόγος", h.REJECT_REASONS, index=None,
+                                      placeholder="Διάλεξε λόγο")
+                comment = st.text_input("Σχόλιο (προαιρετικό)")
+                do_reject = st.form_submit_button("Απόρριψη πρότασης")
+            if do_reject:
+                try:
+                    store.reject(sid, h.rejection_text(reason, comment), user)
+                    state.pop("cust_action", None)
+                    st.rerun()
+                except (ValueError, StoreError) as e:
+                    st.error(h.humanize(e))
+
+        st.markdown('<div class="ne-h" style="margin-top:1rem"></div>', unsafe_allow_html=True)
+        ui.label_row("Ρώτα για αυτή την πρόταση")
+        ui.chat_box(f"chat_s{sid}",
+                    lambda: h.suggestion_context(store.get(sid), ui.customers_map(), items),
+                    placeholder="π.χ. Τι γίνεται αν περιμένουμε ως Τετάρτη;",
+                    footnote="Ο βοηθός βλέπει μόνο τα νούμερα αυτής της πρότασης.")
