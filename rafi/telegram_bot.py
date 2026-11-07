@@ -1,12 +1,14 @@
 """Telegram bot of Ράφι: morning brief and approvals for the Administrator, and the
-message to the customer of the demo after an approval.
+messages to the customer and to the supplier of the demo after an approval.
 
-Only the chat ids of .env are served (TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID);
-updates from any other chat are ignored. Nothing reaches the ERP without a button press,
-and approvals go through rafi.store, which never sends a suggestion twice.
+Only the chat ids of .env are served (TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID,
+TELEGRAM_SUPPLIER_CHAT_ID); updates from any other chat are ignored. Nothing reaches the
+ERP or a supplier without a button press, approvals go through rafi.store, which never
+sends a suggestion twice, and every message is sent once (it is written in the history).
 
 Settings (environment or .env in the repository root):
-  TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID
+  TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_CUSTOMER_CHAT_ID,
+  TELEGRAM_SUPPLIER_CHAT_ID
 
 CLI: python -m rafi.telegram_bot whoami   chat ids of whoever pressed Start
      python -m rafi.telegram_bot brief    morning brief to the Administrator
@@ -27,7 +29,7 @@ import requests
 from app import helpers as h
 from rafi import settings as rafi_settings
 from rafi import store
-from rafi.llm import _read_dotenv
+from rafi.llm import ITEMS_HEADER, _read_dotenv
 from rafi.suggestions import MARGINAL, ORDER
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,11 +40,16 @@ API_URL = "https://api.telegram.org"
 POLL_SECONDS = 30
 BOT_USER = "telegram"            # user recorded in the store for actions from the bot
 CUSTOMER_MESSAGE = "ΜΗΝΥΜΑ_ΠΕΛΑΤΗ"  # history action written by notify_customer
+SUPPLIER_MESSAGE = "ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ"  # purchase history action written by notify_supplier
 WAREHOUSE_DAYS = 7
 MAX_BUTTONS = 30
 NOT_AVAILABLE = "δεν είναι διαθέσιμη ακόμα"
 PURCHASE_REASONS = ["Υπάρχει ακόμα απόθεμα", "Θα παραγγείλω αργότερα", "Άλλο"]
 OTHER = "Άλλο"
+SHORT, LATE = "ΕΛΛΕΙΨΗ", "ΑΡΓΗΣΑΜΕ"  # statuses of rafi.agents.warehouse_agent
+OLD_TOO_LATE = "ΔΕΝ_ΦΤΑΝΕΙ"           # older flag, read as ΕΛΛΕΙΨΗ
+ASSISTANT_DOWN = "Ο βοηθός δεν είναι διαθέσιμος τώρα· δες το dashboard."
+ASK_HINT = 'Μπορείς να μου γράψεις και ερώτηση, π.χ. "Με ποιον να ξεκινήσω σήμερα;"'
 LEGAL_SUFFIXES = ("Μ.Ε.Π.Ε.", "Ι.Κ.Ε.", "Α.Ε.", "Ο.Ε.", "Ε.Ε.")
 
 
@@ -52,7 +59,10 @@ class TelegramError(Exception):
 
 # --- settings -----------------------------------------------------------------
 
-KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CUSTOMER_CHAT_ID")
+KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CUSTOMER_CHAT_ID",
+        "TELEGRAM_SUPPLIER_CHAT_ID")
+ROLES = {"TELEGRAM_ADMIN_CHAT_ID": "Διαχειριστής", "TELEGRAM_CUSTOMER_CHAT_ID": "πελάτης demo",
+         "TELEGRAM_SUPPLIER_CHAT_ID": "προμηθευτής demo"}
 
 
 def config(dotenv=ROOT / ".env"):
@@ -208,9 +218,36 @@ def morning_summary(db=None):
             "suggestions": suggestions}
 
 
+def order_status(o):
+    """ΕΛΛΕΙΨΗ, ΑΡΓΗΣΑΜΕ or "" of one order of open_purchase_orders.
+
+    Fallback for older shapes: a "flag" per line, or only "short".
+    """
+    s = _first(o, "status", "STATUS")
+    if s in (SHORT, LATE):
+        return s
+    flags = [_first(o, "flag", "FLAG", default="")] + [
+        f for l in (o.get("lines") or []) if isinstance(l, dict) for f in l.get("flags") or []]
+    if SHORT in flags or OLD_TOO_LATE in flags or o.get("short"):
+        return SHORT
+    if LATE in flags or o.get("late"):
+        return LATE
+    return ""
+
+
+_RANK = {SHORT: 0, LATE: 1, "": 2}
+
+
 def supplier_orders(warehouse, today=h.SCENARIO_TODAY, days=WAREHOUSE_DAYS):
-    """Supplier orders to approve within `days`, one per (supplier, order-by date)."""
-    last = (pd.Timestamp(today) + timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    """Supplier orders to approve within `days`, one per (supplier, order-by date).
+
+    Reads the orders of rafi.agents.warehouse_agent.open_purchase_orders (supplier_id,
+    supplier_name, order_by, arrival, status/short, total_value_eur, reason, note, lines,
+    affected_deliveries, deliveries_before_arrival); older flat rows (value_eur, flag) still
+    work. Returns [supplier_id, supplier_name, order_by, arrival, status, value_eur, lines,
+    uncovered, before_arrival, reason, note].
+    """
+    last = (pd.Timestamp(today) + timedelta(days=days)).strftime("%Y-%m-%d")
     groups = {}
     for o in (warehouse or {}).get("orders") or []:
         sup = str(_first(o, "supplier_id", "SUPPLIER_ID", default=""))
@@ -220,13 +257,40 @@ def supplier_orders(warehouse, today=h.SCENARIO_TODAY, days=WAREHOUSE_DAYS):
         g = groups.setdefault((sup, order_by), {
             "supplier_id": sup, "order_by": order_by, "value_eur": 0.0, "lines": 0,
             "supplier_name": _first(o, "supplier_name", "SUPPLIER_NAME", default=sup),
-            "short": False})
-        g["value_eur"] += float(_first(o, "value_eur", "VALUE_EUR", default=0) or 0)
+            "arrival": None, "status": "", "uncovered": 0, "before_arrival": 0,
+            "reason": "", "note": ""})
+        g["value_eur"] += float(_first(o, "total_value_eur", "value_eur", "VALUE_EUR",
+                                       default=0) or 0)
         lines = _first(o, "lines", "LINES", "lines_count")
         g["lines"] += len(lines) if isinstance(lines, list) else int(lines or 1)
-        flag = _first(o, "flag", "FLAG", default="")
-        g["short"] = g["short"] or bool(flag) or bool(_first(o, "short", default=False))
-    return sorted(groups.values(), key=lambda g: (g["order_by"], g["supplier_name"]))
+        state = order_status(o)
+        if _RANK[state] < _RANK[g["status"]]:
+            g["status"] = state
+        if state == SHORT:
+            g["uncovered"] += len(o.get("affected_deliveries") or [])
+        g["before_arrival"] += int(o.get("deliveries_before_arrival") or 0)
+        arrival = _first(o, "arrival", "ARRIVAL")
+        if arrival is not None:
+            g["arrival"] = max(str(arrival)[:10], g["arrival"] or "")
+        g["reason"] = g["reason"] or str(_first(o, "reason", "REASON", default="") or "")
+        g["note"] = g["note"] or str(_first(o, "note", default="") or "")
+    return sorted(groups.values(),
+                  key=lambda g: (g["order_by"], _RANK[g["status"]], g["supplier_name"]))
+
+
+def affected_text(n):
+    """'επηρεάζεται 1 παράδοση σε πελάτη' / 'επηρεάζονται 3 παραδόσεις σε πελάτες'."""
+    return ("επηρεάζεται 1 παράδοση σε πελάτη" if n == 1
+            else f"επηρεάζονται {n} παραδόσεις σε πελάτες")
+
+
+def status_text(g):
+    """Short words for the brief: ' · έλλειψη, επηρεάζονται 3 ...' / ' · αργήσαμε ...'."""
+    if g["status"] == SHORT:
+        return f" · έλλειψη, {affected_text(g['uncovered'])}" if g["uncovered"] else " · έλλειψη"
+    if g["status"] == LATE:
+        return " · αργήσαμε (οι πελάτες καλύπτονται)"
+    return ""
 
 
 def regular_orders(suggestions):
@@ -265,9 +329,14 @@ def brief_messages(db=None):
     if w is None:
         text.append(f"Η σύνοψη της αποθήκης {NOT_AVAILABLE}.")
     else:
+        states = [order_status(o) for o in w.get("orders") or []]
         text += [f"Παραγγελίες προμηθευτών προς έγκριση: "
-                 f"{h.fmt_num(_first(w, 'orders_count', default=0))}",
-                 f"Ελλείψεις: {h.fmt_num(_first(w, 'short_count', default=0))}"]
+                 f"{h.fmt_num(_first(w, 'orders_count', default=len(states)))}",
+                 f"Ελλείψεις (δεν καλύπτονται πελάτες): "
+                 f"{h.fmt_num(_first(w, 'short_count', default=states.count(SHORT)))}",
+                 f"Αργήσαμε (πελάτες καλυμμένοι): "
+                 f"{h.fmt_num(_first(w, 'late_count', default=states.count(LATE)))}"]
+    text += ["", esc(ASK_HINT)]
     out.append(("\n".join(text), None))
 
     # (b) needs you
@@ -303,9 +372,8 @@ def brief_messages(db=None):
         text = [f"<b>Αποθήκη · παραγγελίες προμηθευτών {WAREHOUSE_DAYS} ημερών ({len(groups)})</b>"]
         keyboard = []
         for g in groups[:MAX_BUTTONS]:
-            short = " · έλλειψη" if g["short"] else ""
             text.append(f"• {esc(g['supplier_name'])}: έως {h.fmt_date(g['order_by'])} · "
-                        f"{h.fmt_eur(g['value_eur'])}{short}")
+                        f"{h.fmt_eur(g['value_eur'])}{esc(status_text(g))}")
             keyboard.append([button(f"{short_name(g['supplier_name'], 28)} · "
                                     f"{h.fmt_date(g['order_by'])[:-5]}",
                                     f"p:{g['supplier_id']}:{g['order_by']}")])
@@ -322,15 +390,90 @@ def send_brief(api, cfg, db=None):
     return len(msgs)
 
 
+# --- general question ---------------------------------------------------------
+
+def _one_line(text, limit=140):
+    try:
+        from rafi.agents.orchestrator import one_line
+        return one_line(text, limit)
+    except Exception:
+        first = str(text or "").strip().split(". ")[0].rstrip(".")
+        return first[:limit]
+
+
+def question_context(db=None, today=h.SCENARIO_TODAY):
+    """What the assistant may use for a free question of the Administrator: the morning
+    summary (customers and warehouse), the "needs you" list and the warehouse orders of
+    the week, each with a name, a date, € and one sentence. Only numbers from here."""
+    summary = morning_summary(db)
+    c, w, suggestions = summary["customers"], summary["warehouse"], summary["suggestions"]
+    by_id = {s["id"]: s for s in suggestions}
+    needs = []
+    for i in c["needs_you"]:
+        s = by_id.get(i)
+        if s is None or s["status"] != h.PROPOSED:
+            continue
+        name, code = customer_of(s)
+        needs.append({"πελάτης": name, "κωδικός": code, "τύπος": kind_text(s),
+                      "παράδοση": s["delivery_date"], "αξία_eur": s["value_eur"],
+                      "φράση": _one_line(s["payload"].get("REASON"))})
+    n = c["counts"]
+    ctx = {
+        "σήμερα": pd.Timestamp(today).strftime("%Y-%m-%d"),
+        "πελάτες": {"προς_έγκριση": n.get("pending"),
+                    "έκτακτα_δρομολόγια": n.get("extra_routes"),
+                    "κίνδυνοι_απώλειας": n.get("loss_risks"),
+                    "οριακές": n.get("marginal"),
+                    "παραγγελίες": n.get("orders"),
+                    "προσφορές": n.get("offers"),
+                    "αξία_σε_κίνδυνο_eur": c["value_at_risk_eur"],
+                    "αξία_προσφορών_eur": c["offers_value_eur"]},
+        "χρειάζονται_εσένα": needs,
+    }
+    if w is None:
+        ctx["αποθήκη"] = f"Η σύνοψη της αποθήκης {NOT_AVAILABLE}."
+        return ctx
+    states = [order_status(o) for o in w.get("orders") or []]
+    ctx["αποθήκη"] = {"παραγγελίες_εβδομάδας": _first(w, "orders_count", default=len(states)),
+                      "ελλείψεις": _first(w, "short_count", default=states.count(SHORT)),
+                      "αργήσαμε": _first(w, "late_count", default=states.count(LATE))}
+    ctx["παραγγελίες_αποθήκης_εβδομάδας"] = [
+        {"προμηθευτής": g["supplier_name"], "παραγγελία_έως": g["order_by"],
+         "άφιξη": g["arrival"], "αξία_eur": round(g["value_eur"], 2),
+         "κατάσταση": h.label(g["status"]) if g["status"] else "κανονική",
+         "πελάτες_που_δεν_καλύπτονται": g["uncovered"],
+         "φράση": _one_line(g["reason"])}
+        for g in supplier_orders(w, today)]
+    return ctx
+
+
+def answer_question(question, db=None):
+    """(text, from AI) for a free question of the Administrator. The assistant answers only
+    from question_context; if it cannot, a short message to look at the dashboard."""
+    from rafi import llm
+    try:
+        out = llm.answer(question, question_context(db))
+    except Exception as e:  # never let a question break the bot
+        log.warning("answer_question: %s", type(e).__name__)
+        return ASSISTANT_DOWN, False
+    if out.get("source") != llm.AI or not str(out.get("text") or "").strip():
+        return ASSISTANT_DOWN, False
+    return str(out["text"]).strip(), True
+
+
 # --- customer message ---------------------------------------------------------
 
 def customer_text(s):
+    """SALES_NOTE, then the delivery date and the items. An AI note already ends with the
+    code's list (rafi.llm.note_block), so it is not repeated."""
     p = s["payload"]
+    note = p.get("SALES_NOTE") or ""
     text = []
-    if p.get("SALES_NOTE"):
-        text += [esc(p["SALES_NOTE"]), ""]
-    text += [f"Προτεινόμενη παράδοση: {h.fmt_date_long(s['delivery_date'])}", "Είδη:",
-             lines_text(s)]
+    if note:
+        text += [esc(note), ""]
+    if f"\n{ITEMS_HEADER}\n" not in note:
+        text += [f"Προτεινόμενη παράδοση: {h.fmt_date_long(s['delivery_date'])}", ITEMS_HEADER,
+                 lines_text(s)]
     if p.get("TEXT_SOURCE") == "AI":
         text += ["", "<i>Το κείμενο γράφτηκε με τη βοήθεια AI.</i>"]
     return "\n".join(text)
@@ -382,6 +525,77 @@ def notify_customer(suggestion_id) -> bool:
         return False
 
 
+# --- supplier message ---------------------------------------------------------
+
+def _approved_order(supplier_id, order_by, db=None):
+    """Approved purchase rows of one supplier order (same supplier and ORDER_BY)."""
+    return [r for r in store.list_purchase_suggestions(status=store.APPROVED, db=db)
+            if r["supplier_id"] == str(supplier_id) and r["order_by"] == str(order_by)[:10]]
+
+
+def supplier_text(rows):
+    """'Προς: <supplier>', the note to the supplier and, from the code, the exact items,
+    quantities and delivery date (rafi.llm.note_block)."""
+    from rafi import llm
+
+    p0 = rows[0]["payload"]
+    name = p0.get("SUPPLIER_NAME") or rows[0]["supplier_id"]
+    payload = {"SUPPLIER_NAME": name, "NEEDED_BY": max(r["arrival"] for r in rows),
+               "LINES": [{"ITEM_NAME": r["payload"].get("ITEM_NAME") or r["mtrl"],
+                          "QTY1": int(r["qty"]), "UNIT": r["payload"].get("UNIT") or ""}
+                         for r in rows]}
+    ids = sorted(r["id"] for r in rows)
+    note = p0.get("GROUP_NOTE") if p0.get("GROUP_IDS") == ids else None
+    if not note or f"\n{llm.ITEMS_HEADER}\n" not in note:
+        note = llm.compose_note(llm.HELLO, payload, "supplier")  # greeting + exact list
+    text = [f"Προς: {esc(name)}", "", esc(note)]
+    if p0.get("GROUP_IDS") == ids and p0.get("GROUP_NOTE_SOURCE") == llm.AI:
+        text += ["", "<i>Το κείμενο γράφτηκε με τη βοήθεια AI.</i>"]
+    return "\n".join(text)
+
+
+def supplier_notice(supplier_id, order_by, api=None, cfg=None, db=None):
+    """Message the demo supplier about an approved purchase order: (sent, why not).
+
+    Sends only when after_approval_mode is "draft_and_message", the order is approved,
+    TELEGRAM_SUPPLIER_CHAT_ID is set and the supplier was not messaged for it before.
+    Writes ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ in the purchase history of every line of the order.
+    """
+    if rafi_settings.load_settings().get("after_approval_mode") != rafi_settings.DRAFT_AND_MESSAGE:
+        return False, "η ρύθμιση «Μετά την έγκριση» δεν ζητά μήνυμα"
+    cfg = cfg or config()
+    chat = cfg.get("TELEGRAM_SUPPLIER_CHAT_ID")
+    if not chat:
+        return False, "λείπει το TELEGRAM_SUPPLIER_CHAT_ID στο .env"
+    rows = _approved_order(supplier_id, order_by, db)
+    if not rows:
+        return False, "η παραγγελία δεν έχει εγκριθεί"
+    ids = [r["id"] for r in rows]
+    if any(e["action"] == SUPPLIER_MESSAGE for e in store.purchase_history(db=db)
+           if e["purchase_id"] in ids):
+        return False, "ο προμηθευτής έχει ήδη ενημερωθεί για αυτή την παραγγελία"
+    try:
+        send(api or _default_api(cfg), chat, supplier_text(rows))
+    except TelegramError as e:
+        log.warning("notify_supplier: %s", e)
+        return False, "το Telegram δεν απάντησε"
+    with store._purchase_transaction(db) as conn:
+        for pid in ids:
+            store._purchase_log(conn, pid, BOT_USER, SUPPLIER_MESSAGE,
+                                {"Κανάλι": "Telegram", "Προμηθευτής": str(supplier_id),
+                                 "Παραγγελία έως": h.fmt_date(order_by), "Είδη": len(rows)})
+    return True, ""
+
+
+def notify_supplier(supplier_id, order_by, db=None) -> bool:
+    """Message the demo supplier about an approved purchase order. True if it was sent."""
+    try:
+        return supplier_notice(supplier_id, order_by, db=db)[0]
+    except (TelegramError, store.StoreError) as e:
+        log.warning("notify_supplier: %s", e)
+        return False
+
+
 # --- bot ----------------------------------------------------------------------
 
 def _erp_message(e):
@@ -397,6 +611,7 @@ class Bot:
         self.api, self.cfg, self.db = api, cfg, db
         self.admin = str(cfg.get("TELEGRAM_ADMIN_CHAT_ID") or "")
         self.customer = str(cfg.get("TELEGRAM_CUSTOMER_CHAT_ID") or "")
+        self.supplier = str(cfg.get("TELEGRAM_SUPPLIER_CHAT_ID") or "")
         self.waiting = {}   # chat id -> ("ask", id) | ("reject", id) | ("preject", sup, date)
         self.bulk = {}      # chat id -> ids shown in the bulk confirmation
         self.offset = None
@@ -424,6 +639,10 @@ class Bot:
         if self.customer and chat == self.customer:
             if text and not text.startswith("/"):
                 self.say(f"Ο πελάτης του demo απάντησε:\n«{esc(text)}»")
+            return True
+        if self.supplier and chat == self.supplier:
+            if text and not text.startswith("/"):
+                self.say(f"Ο προμηθευτής του demo απάντησε:\n«{esc(text)}»")
             return True
         return False  # unknown chat: ignored
 
@@ -459,7 +678,8 @@ class Bot:
     def on_text(self, text):
         waiting = self.waiting.pop(self.admin, None)
         if text in ("/start", "/help"):
-            self.say("Ράφι · Telegram. Στείλε /brief για την πρωινή ενημέρωση.")
+            self.say("Ράφι · Telegram. Στείλε /brief για την πρωινή ενημέρωση. "
+                     + esc(ASK_HINT))
         elif text == "/brief":
             send_brief(self.api, self.cfg, self.db)
         elif waiting and waiting[0] == "ask":
@@ -468,8 +688,16 @@ class Bot:
             self.reject(waiting[1], h.rejection_text(OTHER, text))
         elif waiting and waiting[0] == "preject":
             self.reject_purchase(waiting[1], waiting[2], h.rejection_text(OTHER, text))
+        elif text and not text.startswith("/"):
+            self.general_question(text)
         else:
-            self.say("Στείλε /brief για την πρωινή ενημέρωση ή διάλεξε από τα κουμπιά.")
+            self.say("Στείλε /brief για την πρωινή ενημέρωση, γράψε μια ερώτηση "
+                     "ή διάλεξε από τα κουμπιά.")
+
+    def general_question(self, question):
+        """A free question of the Administrator, answered from the morning numbers."""
+        text, ai = answer_question(question, self.db)
+        self.say(esc(text) + (f"\n<i>({h.AI_BADGE})</i>" if ai else ""))
 
     # -- buttons --
 
@@ -654,31 +882,75 @@ class Bot:
                         f"{esc(p.get('UNIT') or '')}{state}")
             if p.get("REASON"):
                 text.append(f"  {esc(p['REASON'])}")
+        text += self._order_extras(sup, order_by)
         keyboard = None
         if any(r["status"] == h.PROPOSED for r in rows):
             keyboard = [[button("Εγκρίνω", f"pa:{sup}:{order_by}"),
                          button("Απόρριψη", f"pr:{sup}:{order_by}")]]
         self.say("\n".join(text), keyboard)
 
+    def _order_extras(self, sup, order_by):
+        """Status, uncovered customer deliveries and the supplier message of the order, from
+        open_purchase_orders. [] when the warehouse agent cannot give them."""
+        try:
+            from rafi.agents.warehouse_agent import open_purchase_orders
+            orders = open_purchase_orders(90, db=self.db)
+        except Exception as e:  # missing agent or older rows: the lines above are enough
+            log.info("open_purchase without open_purchase_orders (%s)", type(e).__name__)
+            return []
+        o = next((o for o in orders if str(o.get("supplier_id")) == sup
+                  and str(o.get("order_by"))[:10] == order_by), None)
+        if o is None:
+            return []
+        out, state = [], order_status(o)
+        affected = o.get("affected_deliveries") or []
+        if state == SHORT:
+            out += ["", f"<b>Έλλειψη: {affected_text(len(affected))}</b>"]
+            out += [f"• {esc(short_name(a.get('customer_name') or a.get('trdr')))} · "
+                    f"{h.fmt_date(a.get('date'))} · {h.fmt_qty(a.get('qty'))}"
+                    for a in affected[:10]]
+            if len(affected) > 10:
+                out.append(f"…και άλλες {len(affected) - 10}.")
+        elif state == LATE:
+            n = int(o.get("deliveries_before_arrival") or 0)
+            out += ["", f"<b>Αργήσαμε.</b> Οι {n} παραδόσεις σε πελάτες μέχρι την άφιξη "
+                        f"καλύπτονται από το απόθεμα, αλλά θα πέσουμε κάτω από το απόθεμα "
+                        f"ασφαλείας. Παράγγειλε σήμερα."]
+        if o.get("note"):
+            out += ["", "<b>Μήνυμα προς τον προμηθευτή</b>", esc(o["note"])]
+            if o.get("note_source") == "AI":
+                out.append(f"<i>({h.AI_BADGE})</i>")
+        return out
+
     def approve_purchase(self, sup, order_by):
         try:
+            self._open_rows(sup, order_by)  # a clear message if it is no longer pending
             try:
                 from rafi.agents.warehouse_agent import approve_purchase_order
             except ImportError:
                 approve_purchase_order = self._approve_purchase_fallback
-            approve_purchase_order(sup, order_by, BOT_USER)
+            approve_purchase_order(sup, order_by, BOT_USER, db=self.db)
         except store.StoreError as e:
             self.say(esc(h.humanize(e)))
             return
-        self.say("Η παραγγελία προμηθευτή εγκρίθηκε.")
+        sent, why = supplier_notice(sup, order_by, self.api, self.cfg, self.db)
+        if sent:
+            self.say("Η παραγγελία προμηθευτή εγκρίθηκε. Ο προμηθευτής ενημερώθηκε.")
+        elif rafi_settings.load_settings().get("after_approval_mode") == \
+                rafi_settings.DRAFT_AND_MESSAGE:
+            self.say(f"Η παραγγελία προμηθευτή εγκρίθηκε. Το μήνυμα στον προμηθευτή δεν "
+                     f"στάλθηκε: {esc(why)}.")
+        else:
+            self.say("Η παραγγελία προμηθευτή εγκρίθηκε.")
 
     def reject_purchase(self, sup, order_by, reason):
         try:
+            self._open_rows(sup, order_by)
             try:
                 from rafi.agents.warehouse_agent import reject_purchase_order
             except ImportError:
                 reject_purchase_order = self._reject_purchase_fallback
-            reject_purchase_order(sup, order_by, reason, BOT_USER)
+            reject_purchase_order(sup, order_by, reason, BOT_USER, db=self.db)
         except store.StoreError as e:
             self.say(esc(h.humanize(e)))
             return
@@ -690,11 +962,11 @@ class Bot:
             raise store.StoreError("Η παραγγελία δεν είναι πια προς έγκριση.")
         return rows
 
-    def _approve_purchase_fallback(self, sup, order_by, user):
+    def _approve_purchase_fallback(self, sup, order_by, user, db=None):
         for r in self._open_rows(sup, order_by):
             store.approve_purchase(r["id"], user, db=self.db)
 
-    def _reject_purchase_fallback(self, sup, order_by, reason, user):
+    def _reject_purchase_fallback(self, sup, order_by, reason, user, db=None):
         for r in self._open_rows(sup, order_by):
             store.reject_purchase(r["id"], reason, user, db=self.db)
 
@@ -717,6 +989,12 @@ def whoami(api):
     return list(seen.items())
 
 
+def role_text(chat_id, cfg):
+    """'  ← Διαχειριστής' when the chat id is one of the .env settings."""
+    roles = [ROLES[k] for k in ROLES if cfg.get(k) and str(cfg[k]) == str(chat_id)]
+    return f"  ← {', '.join(roles)}" if roles else ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m rafi.telegram_bot",
                                  description="Telegram bot του Ράφι.")
@@ -735,7 +1013,10 @@ def main(argv=None):
             if not people:
                 print("Κανένα μήνυμα. Άνοιξε το bot στο Telegram, πάτα Start και ξανατρέξε.")
             for chat_id, name in people:
-                print(f"{chat_id}\t{name}")
+                print(f"{chat_id}\t{name}{role_text(chat_id, cfg)}")
+            print()
+            for key in ROLES:
+                print(f"{key}={cfg[key] or '(κενό)'}")
             return 0
         if not cfg["TELEGRAM_ADMIN_CHAT_ID"]:
             print("Λείπει το TELEGRAM_ADMIN_CHAT_ID στο .env (δες: whoami).", file=sys.stderr)

@@ -4,9 +4,10 @@
   2. customer agent  suggestions for customers, AI texts for the important ones, store
   3. warehouse agent purchase suggestions from suppliers (store)
   4. supplier notes  message to each supplier for the orders of the next 7 days (AI or template)
-  5. coordination    an item that will not arrive in time (ΔΕΝ_ΦΤΑΝΕΙ): the stock we have goes
+  5. coordination    an item ordered too late (ΑΡΓΗΣΑΜΕ / ΕΛΛΕΙΨΗ): the stock we have goes
                      to customer deliveries in priority order (urgent and loss risks first,
-                     then by value). Suggestions left without stock get ΕΛΛΕΙΨΗ_ΑΠΟΘΗΚΗΣ.
+                     then by value). Only ΕΛΛΕΙΨΗ leaves deliveries without stock; their
+                     suggestions get ΕΛΛΕΙΨΗ_ΑΠΟΘΗΚΗΣ.
   6. summary         morning_summary(): the same numbers for the terminal, Telegram, dashboard
 
 Every decision is plain code; the AI only writes texts. Nothing goes to the ERP or to a
@@ -64,7 +65,7 @@ def _dm(d):
 
 
 def coordinate_shortages(db=None, today=TODAY, user=USER):
-    """Share the stock of every ΔΕΝ_ΦΤΑΝΕΙ item among the customer deliveries before it arrives.
+    """Share the stock of every late item among the customer deliveries before it arrives.
 
     Stock = the warehouse agent's stock today + approved purchases arriving before then.
     Order: suggestions that need you (urgent, extra route, loss risk), then other suggestions
@@ -74,29 +75,20 @@ def coordinate_shortages(db=None, today=TODAY, user=USER):
     Returns one dict per delivery not fully covered.
     """
     today = pd.Timestamp(today)
-    by_id = {s["id"]: s for s in store.list_suggestions(db=db)}
+    suggestions = store.list_suggestions(db=db)
+    by_id = {s["id"]: s for s in suggestions}
+    rank = wh.delivery_rank(suggestions)
     incoming = wh.incoming_from_store(db, today)
-    short_rows = [r for r in store.list_purchase_suggestions(status=store.PROPOSED, db=db)
-                  if r["flag"] == wh.TOO_LATE]
+    late_rows = [r for r in store.list_purchase_suggestions(status=store.PROPOSED, db=db)
+                 if r["flag"] in wh.LATE_FLAGS]
     out = []
-    for r in short_rows:
+    for r in late_rows:
         p = r["payload"]
-        arrival = pd.Timestamp(r["arrival"])
-        stock = float(p.get("STOCK_NOW") or 0.0) + sum(
-            q for d, q in incoming.get(int(r["mtrl"]), {}).items() if d < arrival)
-
-        def rank(a):
-            s = by_id.get(a.get("SUGGESTION_ID"))
-            if s is None:
-                return (2, 0.0, a["DELIVERY_DATE"], a["TRDR"])
-            return (0 if customer_agent.needs_you(s) else 1, -(s["value_eur"] or 0.0),
-                    a["DELIVERY_DATE"], a["TRDR"])
-
-        for a in sorted(p.get("AFFECTED") or [], key=rank):
-            given = min(stock, float(a["QTY"]))
-            stock -= given
-            missing = float(a["QTY"]) - given
-            if missing < 0.5:  # shown as a whole number: nothing to say
+        stock = wh.stock_until(p.get("STOCK_NOW"), incoming.get(int(r["mtrl"])), r["arrival"])
+        shared = wh.cover_deliveries(stock, p.get("AFFECTED") or [], rank)
+        for a in sorted(shared, key=rank):
+            missing = a["MISSING"]
+            if not missing:  # covered (less than half a unit is shown as 0)
                 continue
             sid = a.get("SUGGESTION_ID")
             s = by_id.get(sid)
@@ -137,8 +129,9 @@ def morning_summary(db=None) -> dict:
                value_at_risk_eur, offers_value_eur (rafi.suggestions.pending_totals),
                needs_you [suggestion_id, trdr, customer_name, kind, delivery_date, value_eur,
                one_line] by priority
-    warehouse: orders_count (supplier orders of the next 7 days), short_count, orders
-               (open_purchase_orders(7))
+    warehouse: orders_count (supplier orders of the next 7 days), short_count (ΕΛΛΕΙΨΗ:
+               customer deliveries not covered), late_count (ΑΡΓΗΣΑΜΕ: customers covered,
+               under the safety stock), orders (open_purchase_orders(7))
     """
     pending = store.list_suggestions(status=store.PROPOSED, db=db)
     names = wh.customer_names()
@@ -166,7 +159,8 @@ def morning_summary(db=None) -> dict:
         "customers": {"counts": counts, "value_at_risk_eur": round(totals["at_risk_eur"], 2),
                       "offers_value_eur": round(totals["offers_eur"], 2), "needs_you": needs},
         "warehouse": {"orders_count": len(orders),
-                      "short_count": sum(1 for o in orders if o["short"]),
+                      "short_count": sum(1 for o in orders if o["status"] == wh.SHORT),
+                      "late_count": sum(1 for o in orders if o["status"] == wh.LATE),
                       "orders": orders},
     }
 
@@ -232,7 +226,8 @@ def warehouse_briefing(summary, shortages=None):
     w = summary["warehouse"]
     value = sum(o["total_value_eur"] for o in w["orders"])
     out = [f"Αποθήκη · παραγγελίες σε προμηθευτές για τις επόμενες {WAREHOUSE_DAYS} ημέρες: "
-           f"{w['orders_count']} (δεν φτάνουν εγκαίρως: {w['short_count']}) · "
+           f"{w['orders_count']} ({wh.SHORT}: {w['short_count']} · "
+           f"{wh.LATE}: {w.get('late_count', 0)}) · "
            f"αξία {value:,.2f} € σε τιμή καταλόγου"]
     if shortages is not None:
         flagged = sum(1 for s in shortages if s["flagged"])
@@ -242,7 +237,7 @@ def warehouse_briefing(summary, shortages=None):
         out.append(f"{'έως':<10} {'άφιξη':<10} {'προμηθευτής':<34} {'είδη':>4} {'€':>10}  "
                    f"σημείωμα")
     for o in w["orders"]:
-        mark = "ΔΕΝ_ΦΤΑΝΕΙ " if o["short"] else ""
+        mark = f"{o['status']} " if o.get("status") else ""
         out.append(f"{o['order_by']:<10} {o['arrival']:<10} {str(o['supplier_name'])[:34]:<34} "
                    f"{len(o['lines']):>4} {o['total_value_eur']:>10,.2f}  {mark}"
                    f"[{o['note_source']}]")

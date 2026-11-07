@@ -45,6 +45,12 @@ LABELS = {
     "ΑΠΟΡΡΙΨΗ": "Απόρριψη",
     "ΑΠΟΣΤΟΛΗ": "Αποστολή στο ERP",
     "ΣΦΑΛΜΑ_ΑΠΟΣΤΟΛΗΣ": "Σφάλμα αποστολής",
+    "ΜΗΝΥΜΑ_ΠΕΛΑΤΗ": "Μήνυμα στον πελάτη",
+    "ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ": "Μήνυμα στον προμηθευτή",
+    # purchase flags (warehouse agent)
+    "ΑΡΓΗΣΑΜΕ": "Αργήσαμε",
+    "ΕΛΛΕΙΨΗ": "Έλλειψη",
+    "ΔΕΝ_ΦΤΑΝΕΙ": "Έλλειψη",
 }
 
 TAB_NEEDS_YOU, TAB_ORDERS, TAB_OFFERS = "Χρειάζονται εσένα", "Παραγγελίες", "Προσφορές"
@@ -56,7 +62,7 @@ REJECT_REASONS = ["Ο πελάτης έχει ακόμα απόθεμα", "Ο π
 
 AFTER_APPROVAL_OPTIONS = {
     _settings.DRAFT_ONLY: "Μόνο πρόχειρη στο ERP",
-    _settings.DRAFT_AND_MESSAGE: "Πρόχειρη στο ERP και μήνυμα στον πελάτη",
+    _settings.DRAFT_AND_MESSAGE: "Πρόχειρη και μήνυμα σε πελάτη/προμηθευτή",
 }
 
 ASSISTANT_UNAVAILABLE = "Ο βοηθός AI δεν είναι ακόμα διαθέσιμος"
@@ -140,13 +146,21 @@ def flag_labels(s):
     return out
 
 
+SYSTEM_USERS = {"orchestrator": "Σύστημα (συντονιστής)", "warehouse_agent": "Σύστημα (αποθήκη)"}
+
+
 def user_label(user, salesmen=None):
-    """Who did it, in words: 'Σύστημα', 'Διαχειριστής' or the salesman's name."""
+    """Who did it, in words: 'Σύστημα', 'Διαχειριστής', 'Διαχειριστής (Telegram)' or the
+    salesman's name."""
     u = str(user)
     if u == "system":
         return "Σύστημα"
     if u == "admin":
         return "Διαχειριστής"
+    if u == "telegram":
+        return "Διαχειριστής (Telegram)"
+    if u in SYSTEM_USERS:
+        return SYSTEM_USERS[u]
     if salesmen is not None and u.isdigit() and int(u) in salesmen:
         return str(salesmen[int(u)])
     return u
@@ -355,8 +369,15 @@ def history_details(h, items_map=None):
     return str(d)
 
 
+KIND_CUSTOMERS, KIND_WAREHOUSE, KIND_ALL = "Πελάτες", "Αποθήκη", "Όλα"
+HISTORY_KINDS = [KIND_ALL, KIND_CUSTOMERS, KIND_WAREHOUSE]
+
+
 def history_rows(entries, customers_map=None, items_map=None, salesmen=None):
-    """Rows for the history table, newest first."""
+    """Rows for the history table, newest first.
+
+    Hidden columns (start with "_"): _trdr, _key (who, for the filter), _kind (Πελάτες).
+    """
     customers_map = customers_map or {}
     rows = []
     for h in sorted(entries, key=lambda h: h["id"], reverse=True):
@@ -364,8 +385,69 @@ def history_rows(entries, customers_map=None, items_map=None, salesmen=None):
         rows.append({"Ημερομηνία": pd.Timestamp(h["at"]), "Πελάτης": name, "Κωδικός": code,
                      "Τύπος": label(h["action_type"]), "Κίνηση": label(h["action"]),
                      "Λεπτομέρειες": history_details(h, items_map),
-                     "Χρήστης": user_label(h["user"], salesmen), "_trdr": int(h["trdr"])})
+                     "Χρήστης": user_label(h["user"], salesmen), "_trdr": int(h["trdr"]),
+                     "_key": f"c:{int(h['trdr'])}", "_kind": KIND_CUSTOMERS})
     return rows
+
+
+def purchase_history_details(e, purchase=None):
+    """Details of one purchase history entry: the item and quantity, then what happened."""
+    d = e.get("details") or {}
+    p = (purchase or {}).get("payload") or {}
+    item = ""
+    if purchase:
+        item = (f"{p.get('ITEM_NAME') or purchase.get('mtrl')}: "
+                f"{fmt_qty(purchase.get('qty'))} {p.get('UNIT') or ''}").rstrip()
+    action = e.get("action")
+    if action == "ΔΗΜΙΟΥΡΓΙΑ":
+        more = f"παραγγελία έως {dm(d['order_by'])}" if d.get("order_by") else ""
+        if d.get("flag"):
+            more += f" · {label(d['flag'])}"
+    elif action == "ΕΓΚΡΙΣΗ":
+        more = "γράφτηκε η εντολή αγοράς"
+    elif action == "ΑΠΟΡΡΙΨΗ":
+        more = f"Λόγος: {d.get('reason', '')}"
+    elif action == "ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ":
+        more = f"μήνυμα μέσω {d.get('Κανάλι') or 'Telegram'}"
+    else:
+        more = " · ".join(f"{label(k)}: {v}" for k, v in d.items() if v not in (None, "", []))
+    return " · ".join(x for x in (item, more) if x)
+
+
+def purchase_history_rows(entries, purchases=(), salesmen=None):
+    """Rows of the purchase history (warehouse) in the same columns as history_rows, with
+    type «Αποθήκη» and the supplier in the place of the customer. Newest first."""
+    by_id = {p["id"]: p for p in purchases or []}
+    rows = []
+    for e in sorted(entries, key=lambda e: e["id"], reverse=True):
+        p = by_id.get(e["purchase_id"])
+        sup = str(p["supplier_id"]) if p else ""
+        name = ((p or {}).get("payload") or {}).get("SUPPLIER_NAME") or sup or "Προμηθευτής"
+        rows.append({"Ημερομηνία": pd.Timestamp(e["at"]), "Πελάτης": name, "Κωδικός": sup,
+                     "Τύπος": KIND_WAREHOUSE, "Κίνηση": label(e["action"]),
+                     "Λεπτομέρειες": purchase_history_details(e, p),
+                     "Χρήστης": user_label(e["user"], salesmen), "_trdr": None,
+                     "_key": f"s:{sup}", "_kind": KIND_WAREHOUSE})
+    return rows
+
+
+def merge_history(*parts):
+    """All history rows together, newest first (one time order for customers and warehouse)."""
+    rows = [r for part in parts for r in part]
+    return sorted(rows, key=lambda r: r["Ημερομηνία"], reverse=True)
+
+
+def filter_history(rows, kind=KIND_ALL, key=None, actions=()):
+    """Rows of one kind (Πελάτες / Αποθήκη / Όλα), one customer or supplier, some actions."""
+    return [r for r in rows
+            if (kind in (None, KIND_ALL) or r["_kind"] == kind)
+            and (key is None or r["_key"] == key)
+            and (not actions or r["Κίνηση"] in actions)]
+
+
+def visible(row):
+    """The row without its hidden columns."""
+    return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
 # --- assistant ---------------------------------------------------------------
@@ -608,9 +690,57 @@ def fmt_date_words(d):
     return "—" if t is None else f"{WEEKDAYS[t.weekday()]} {t.day} {MONTHS_GEN[t.month - 1]} {t.year}"
 
 
+def _plural(n, one, many):
+    return f"{fmt_num(n)} {one if n == 1 else many}"
+
+
+def morning_customers_text(c):
+    """One sentence from morning_summary()["customers"] (counts, value_at_risk_eur, ...)."""
+    n = c.get("counts") or {}
+    if n.get("pending") is None:
+        return ""
+    needs = c.get("needs_you")
+    text = f"Περιμένουν έγκριση {_plural(n['pending'], 'πρόταση', 'προτάσεις')}"
+    if isinstance(needs, list):
+        text += f", από τις οποίες {fmt_num(len(needs))} χρειάζονται εσένα"
+    text += "."
+    parts = []
+    if n.get("extra_routes"):
+        parts.append(_plural(n["extra_routes"], "έκτακτο δρομολόγιο", "έκτακτα δρομολόγια"))
+    if n.get("loss_risks"):
+        parts.append(_plural(n["loss_risks"], "κίνδυνος απώλειας", "κίνδυνοι απώλειας"))
+    if parts:
+        text += " " + " και ".join(parts) + "."
+    if c.get("value_at_risk_eur") is not None:
+        text += f" Αξία σε κίνδυνο {fmt_eur(c['value_at_risk_eur'])}."
+    return text
+
+
+def morning_warehouse_text(w):
+    """One sentence from morning_summary()["warehouse"] (orders_count, short_count, ...)."""
+    if w.get("orders_count") is None:
+        return ""
+    n = w["orders_count"]
+    if not n:
+        return "Καμία παραγγελία σε προμηθευτή μέσα στην εβδομάδα."
+    text = f"{_plural(n, 'παραγγελία', 'παραγγελίες')} σε προμηθευτές μέσα στην εβδομάδα"
+    value = sum(float(o.get("total_value_eur") or 0) for o in w.get("orders") or [])
+    if value:
+        text += f", {fmt_eur(value)} σε τιμή καταλόγου"
+    short, late = w.get("short_count") or 0, w.get("late_count") or 0
+    if short:
+        text += f". Ελλείψεις: {fmt_num(short)}, με πελάτες που δεν καλύπτονται"
+    if late:
+        text += f". Αργήσαμε: {fmt_num(late)}, οι πελάτες καλύπτονται"
+    if not short and not late:
+        text += ", όλες στην ώρα τους"
+    return text + "."
+
+
 def morning_texts():
-    """{"customers": text, "warehouse": text} from rafi.agents.orchestrator.morning_summary,
-    keeping only plain texts. {} while the coordinator is not there or fails."""
+    """{"customers": text, "warehouse": text} made from the numbers of
+    rafi.agents.orchestrator.morning_summary. A part without numbers is left out, so the
+    page shows no empty line; {} while the coordinator is not there or fails."""
     import importlib
     try:
         out = importlib.import_module("rafi.agents.orchestrator").morning_summary()
@@ -618,11 +748,12 @@ def morning_texts():
         return {}
     if not isinstance(out, dict):
         return {}
+    makers = {"customers": morning_customers_text, "warehouse": morning_warehouse_text}
     texts = {}
-    for k in ("customers", "warehouse"):
+    for k, make in makers.items():
         v = out.get(k)
         if isinstance(v, dict):
-            v = v.get("text") or v.get("summary")
+            v = v.get("text") or make(v)
         if isinstance(v, str) and v.strip():
             texts[k] = v.strip()
     return texts
@@ -631,6 +762,26 @@ def morning_texts():
 MESSAGE_SENT = "Στάλθηκε και μήνυμα στον πελάτη."
 MESSAGE_NOT_SENT = "Το μήνυμα στον πελάτη δεν στάλθηκε."
 MESSAGE_NOT_READY = "Το μήνυμα στον πελάτη δεν στάλθηκε: η αποστολή μηνυμάτων δεν είναι ακόμα ενεργή."
+
+
+SUPPLIER_SENT = "Στάλθηκε και μήνυμα στον προμηθευτή."
+SUPPLIER_NOT_SENT = "Το μήνυμα στον προμηθευτή δεν στάλθηκε"
+
+
+def notify_supplier_after_approval(supplier_id, order_by, mode):
+    """After a purchase approval: message the supplier when the setting asks for it.
+
+    Returns None when no message is wanted, else (streamlit kind, text) for the page.
+    """
+    if mode != _settings.DRAFT_AND_MESSAGE:
+        return None
+    import importlib
+    try:
+        bot = importlib.import_module("rafi.telegram_bot")
+        ok, why = bot.supplier_notice(supplier_id, str(order_by)[:10])
+    except Exception:
+        return ("warning", SUPPLIER_NOT_SENT + ".")
+    return ("success", SUPPLIER_SENT) if ok else ("warning", f"{SUPPLIER_NOT_SENT}: {why}.")
 
 
 def notify_after_approval(suggestion_id, mode):

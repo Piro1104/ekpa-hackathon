@@ -1,5 +1,6 @@
 """Streamlit pieces shared by the pages: look, reference data, cards, tiles, chat."""
 import html
+import os
 import re
 import subprocess
 import sys
@@ -69,7 +70,7 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] p code {{
            white-space: nowrap; vertical-align: 2px; margin-right: 6px; }}
 .ne-tag.urgent, .ne-tag.short {{ background: #B4461E; }}
 .ne-tag.loss {{ background: #8E2A35; }}
-.ne-tag.call {{ background: #7A5B12; }}
+.ne-tag.call, .ne-tag.late {{ background: #7A5B12; }}
 .ne-tag.offer {{ background: #2F5D8A; }}
 .ne-tag.wh {{ background: #24456B; }}
 .ne-tag.buy {{ background: #E3ECF5; color: #24456B; }}
@@ -81,6 +82,7 @@ section[data-testid="stSidebar"] [data-testid="stPageLink"] p code {{
 .ne-tiles {{ display: grid; gap: 0.75rem; margin-bottom: 0.9rem; }}
 .ne-tiles.c2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
 .ne-tiles.c3 {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+.ne-tiles.c4 {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
 .ne-tile {{ border: 1px solid #DDE3E0; background: #F7F8F7; border-radius: 2px; padding: 0.75rem 1rem; }}
 .ne-panel-body .ne-tile, [class*="st-key-ne_page"] .ne-tile {{ background: #FFFFFF; }}
 .ne-tile .l {{ color: #5B6560; font-size: 0.86rem; }}
@@ -312,7 +314,8 @@ def empty_state(suggestions):
     if st.button("Υπολογισμός προτάσεων τώρα", type="primary"):
         with st.spinner("Υπολογίζονται οι προτάσεις της ημέρας. Χρειάζεται περίπου ένα λεπτό..."):
             done = subprocess.run([sys.executable, str(ROOT / "scripts" / "daily_run.py")],
-                                  cwd=ROOT, capture_output=True, text=True)
+                                  cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         if done.returncode == 0:
             st.rerun()
         st.error("Ο υπολογισμός δεν ολοκληρώθηκε. Τρέξε python scripts/daily_run.py "

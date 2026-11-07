@@ -99,17 +99,20 @@ with right, st.container(key="ne_block_warehouse"):
         w = wh.metrics(orders)
         ui.tiles([
             ("Παραγγελίες σε προμηθευτές", h.fmt_num(w["orders"]), "αυτή την εβδομάδα", ""),
-            ("Δεν φτάνει η αποθήκη", h.fmt_num(w["short_items"]),
+            ("Ελλείψεις αποθήκης", h.fmt_num(w["short_items"]),
              f"{'είδος' if w['short_items'] == 1 else 'είδη'} · "
-             f"{w['short_deliveries']} παραδόσεις", "warn" if w["short_items"] else ""),
-        ], cols=2)
+             f"{w['short_deliveries']} παραδόσεις δεν καλύπτονται",
+             "warn" if w["short_items"] else ""),
+            ("Αργήσαμε", h.fmt_num(w["late_items"]),
+             "πελάτες καλυμμένοι", ""),
+        ], cols=3)
         st.markdown('<div class="ne-h">Χρειάζονται εσένα σήμερα</div>', unsafe_allow_html=True)
         if not orders:
             st.markdown('<p class="ne-muted">Καμία παραγγελία σε προμηθευτή αυτή την εβδομάδα.</p>',
                         unsafe_allow_html=True)
         for o in wh.sort_orders(orders)[:TOP]:
             key = wh.order_key(o)
-            t = ui.tag("Δεν φτάνει", "short") if o.get("short") else ui.tag("Αγορά", "buy")
+            t = ui.tag(*wh.tag_of(o))
             row(f"w{ui.safe_key(key)}", t, wh.home_sentence(o), ui.open_purchase, (key,))
 
 st.write("")

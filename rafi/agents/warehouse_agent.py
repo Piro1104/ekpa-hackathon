@@ -13,6 +13,11 @@ Step by step, all in plain code (no AI):
                    - our own promotions in the horizon: demand x the item's past promo lift
   4. simulation    day by day: stock - demand + arrivals. When the stock at the end of the
                    supplier's lead time would drop under the safety stock, we order.
+                   An order that should have gone out before today is either
+                   ΑΡΓΗΣΑΜΕ   the stock covers every customer delivery until the goods arrive,
+                              but we drop under the safety stock, or
+                   ΕΛΛΕΙΨΗ    some customer deliveries before the arrival are not covered
+                              (the orchestrator flags them ΕΛΛΕΙΨΗ_ΑΠΟΘΗΚΗΣ)
   5. store         purchase suggestions ΠΡΟΤΑΣΗ -> ΕΓΚΡΙΘΗΚΕ / ΑΠΟΡΡΙΦΘΗΚΕ (rafi.store);
                    an approved one is written as JSON to purchase_orders/
 
@@ -49,7 +54,11 @@ SEASONAL_CATEGORY = "Εποχικά"
 DEFAULTS = {"stock_cover_weeks": 4, "safety_weeks": 1}
 
 FILE, ESTIMATE = "ΑΡΧΕΙΟ", "ΕΚΤΙΜΗΣΗ"
-TOO_LATE = "ΔΕΝ_ΦΤΑΝΕΙ"
+LATE = "ΑΡΓΗΣΑΜΕ"           # ordered too late; customers covered, under the safety stock
+SHORT = "ΕΛΛΕΙΨΗ"          # ordered too late; some customer deliveries are not covered
+OLD_TOO_LATE = "ΔΕΝ_ΦΤΑΝΕΙ"  # older stores: read as ΕΛΛΕΙΨΗ
+LATE_FLAGS = (LATE, SHORT, OLD_TOO_LATE)
+MISSING_MIN = 0.5          # less than this is shown as 0, so it is not a shortage
 UNITS = {"ΚΙΒ": "κιβ.", "ΤΕΜ": "τεμ."}
 
 
@@ -389,7 +398,7 @@ def simulate_item(demand, stock, lead_days, min_qty, safety_weeks=DEFAULTS["safe
                  rounded up, at least MIN_ORDER_QTY. (Same as "demand over lead time + 2 weeks
                  + safety - stock when ordering": the lead-time demand is counted once.)
     If ORDER_BY is before today, the order goes out on the first working day from today and is
-    flagged ΔΕΝ_ΦΤΑΝΕΙ. The simulation goes on after every arrival. Missing stock is carried
+    flagged ΑΡΓΗΣΑΜΕ (plan() makes it ΕΛΛΕΙΨΗ when customer deliveries are not covered). The simulation goes on after every arrival. Missing stock is carried
     as negative (customers wait for it). Orders are only planned with a breach in the horizon.
     """
     today = pd.Timestamp(today)
@@ -432,7 +441,7 @@ def simulate_item(demand, stock, lead_days, min_qty, safety_weeks=DEFAULTS["safe
             "QTY": qty, "NEEDED_QTY": round(max(need, 0.0), 2),
             "SAFETY_STOCK": round(safety, 2),
             "STOCK_BEFORE_ARRIVAL": round(float(before), 2),
-            "FLAG": TOO_LATE if ideal < today else "",
+            "FLAG": LATE if ideal < today else "",
         })
         arrivals[a] += qty
         start = a + 1
@@ -442,7 +451,7 @@ def simulate_item(demand, stock, lead_days, min_qty, safety_weeks=DEFAULTS["safe
 
 
 def affected_deliveries(target_rows, mtrl, today, arrival, level=None):
-    """Customer deliveries of the item before the supplier's goods arrive (for ΔΕΝ_ΦΤΑΝΕΙ).
+    """Customer deliveries of the item before the supplier's goods arrive (late orders).
 
     SHORT says whether the projected stock is already gone on that day.
     """
@@ -460,6 +469,66 @@ def affected_deliveries(target_rows, mtrl, today, arrival, level=None):
     return out
 
 
+def delivery_rank(suggestions):
+    """Sort key for sharing a short stock among customer deliveries.
+
+    Suggestions that need you (urgent, extra route, loss risk) first, then the other
+    suggestions by value, then forecast deliveries without a suggestion; same rank ->
+    earlier date first. The orchestrator uses the same order.
+    """
+    from rafi.agents.customer_agent import needs_you
+
+    by_id = {s.get("id"): s for s in suggestions or []}
+
+    def rank(a):
+        s = by_id.get(a.get("SUGGESTION_ID"))
+        if s is None:
+            return (2, 0.0, a["DELIVERY_DATE"], a["TRDR"])
+        return (0 if needs_you(s) else 1, -(s.get("value_eur") or 0.0),
+                a["DELIVERY_DATE"], a["TRDR"])
+    return rank
+
+
+def cover_deliveries(stock, deliveries, rank=None):
+    """Give `stock` to the deliveries in `rank` order. Returns copies, in the input order,
+    with MISSING = quantity not covered (0 when covered)."""
+    order = sorted(range(len(deliveries)),
+                   key=lambda i: (rank or (lambda a: (a["DELIVERY_DATE"], a["TRDR"])))(
+                       deliveries[i]))
+    left, missing = max(float(stock), 0.0), {}
+    for i in order:
+        qty = float(deliveries[i]["QTY"])
+        given = min(left, qty)
+        left -= given
+        miss = qty - given
+        missing[i] = round(miss, 2) if miss >= MISSING_MIN else 0.0
+    return [{**a, "MISSING": missing[i]} for i, a in enumerate(deliveries)]
+
+
+def stock_until(stock_now, incoming, arrival):
+    """Stock today + approved purchases that arrive before `arrival`."""
+    arrival = pd.Timestamp(arrival)
+    return float(stock_now or 0.0) + sum(q for d, q in (incoming or {}).items()
+                                         if pd.Timestamp(d) < arrival)
+
+
+def flag_state(flag):
+    """ΕΛΛΕΙΨΗ, ΑΡΓΗΣΑΜΕ or "" (the old ΔΕΝ_ΦΤΑΝΕΙ reads as ΕΛΛΕΙΨΗ)."""
+    if flag in (SHORT, OLD_TOO_LATE):
+        return SHORT
+    return LATE if flag == LATE else ""
+
+
+def uncovered(affected, flag=SHORT):
+    """Customer deliveries not covered by the stock. Older rows without MISSING: all of them."""
+    if flag_state(flag) != SHORT:
+        return []
+    affected = affected or []
+    if any("MISSING" in a for a in affected):
+        return [a for a in affected if (a.get("MISSING") or 0) > 0]
+    return list(affected)
+
+
 # --- texts ------------------------------------------------------------------
 
 def _dm(d):
@@ -471,9 +540,20 @@ def _qty(x):
     return f"{x:,.0f}".replace(",", ".")
 
 
+def affected_phrase(n):
+    """'επηρεάζεται 1 παράδοση' / 'επηρεάζονται 3 παραδόσεις' (+ ' σε πελάτες')."""
+    return ("επηρεάζεται 1 παράδοση σε πελάτη" if n == 1
+            else f"επηρεάζονται {n} παραδόσεις σε πελάτες")
+
+
 def _reason_head(o):
-    """First sentence of the REASON: when the item runs out (or under the safety stock)."""
-    if o.get("STOCKOUT_DATE") is not None and pd.notna(o["STOCKOUT_DATE"]):
+    """First sentence of the REASON: when the item runs out (or under the safety stock).
+
+    ΑΡΓΗΣΑΜΕ always says "under the safety stock": the customers are covered until the
+    goods arrive, so "runs out" would contradict the rest of the text.
+    """
+    if (o.get("FLAG") != LATE and o.get("STOCKOUT_DATE") is not None
+            and pd.notna(o["STOCKOUT_DATE"])):
         return (f"Το «{o['ITEM_NAME']}» τελειώνει περίπου {_dm(o['STOCKOUT_DATE'])} "
                 f"με τη ζήτηση που προβλέπουμε.")
     return (f"Το «{o['ITEM_NAME']}» πέφτει κάτω από το απόθεμα ασφαλείας "
@@ -486,11 +566,28 @@ def reason_text(o):
     unit = o["UNIT"]
     head = _reason_head(o)
     lead = f" Ο προμηθευτής θέλει {o['LEAD_TIME_DAYS']} εργάσιμες· "
-    if o["FLAG"] == TOO_LATE:
-        n = len(o["AFFECTED"])
-        tail = (f"έπρεπε να είχε παραγγελθεί έως {_dm(o['IDEAL_ORDER_BY'])}. Παράγγειλε "
-                f"{_qty(o['QTY'])} {unit} έως {_dm(o['ORDER_BY'])}, φτάνουν {_dm(o['ARRIVAL'])}"
-                f"· επηρεάζονται {n} παραδόσεις σε πελάτες πριν την άφιξη.")
+    state = flag_state(o["FLAG"])
+    if state:
+        affected = o.get("AFFECTED") or []
+        n_all = len(affected)
+        if state == LATE:
+            if n_all == 0:
+                cover = "Μέχρι την άφιξη δεν έχουμε παραδόσεις σε πελάτες"
+            elif n_all == 1:
+                cover = "Η 1 παράδοση σε πελάτη μέχρι την άφιξη καλύπτεται από το απόθεμα"
+            else:
+                cover = (f"Οι {n_all} παραδόσεις σε πελάτες μέχρι την άφιξη καλύπτονται "
+                         f"από το απόθεμα")
+            cover += ", αλλά θα πέσουμε κάτω από το απόθεμα ασφαλείας."
+        else:
+            short = uncovered(affected, o["FLAG"])
+            missing = sum(a.get("MISSING") or a["QTY"] for a in short)
+            cover = (f"Το απόθεμα δεν φτάνει για όλες τις παραδόσεις μέχρι την άφιξη: "
+                     f"{affected_phrase(len(short))} (λείπουν "
+                     f"{_qty(math.ceil(missing - 1e-9))} {unit}).")
+        tail = (f"έπρεπε να είχε παραγγελθεί έως {_dm(o['IDEAL_ORDER_BY'])}. {cover} "
+                f"Παράγγειλε {_qty(o['QTY'])} {unit} το συντομότερο (έως {_dm(o['ORDER_BY'])}), "
+                f"φτάνουν {_dm(o['ARRIVAL'])}.")
     else:
         tail = f"παράγγειλε {_qty(o['QTY'])} {unit} έως {_dm(o['ORDER_BY'])}."
     if o["QTY"] > math.ceil(o["NEEDED_QTY"] - 1e-9) and o["QTY"] == o["MIN_ORDER_QTY"]:
@@ -542,6 +639,7 @@ def plan(deliveries, items, customers, details, suggestions, promos, suppliers,
 
     it = items.set_index("MTRL")
     sup = suppliers.set_index("MTRCATEGORY")
+    rank = delivery_rank(suggestions)
     rows = []
     for s in stock.itertuples(index=False):
         cat = it.at[s.MTRL, "MTRCATEGORY"]
@@ -562,13 +660,19 @@ def plan(deliveries, items, customers, details, suggestions, promos, suppliers,
                 "PRICER": float(it.at[s.MTRL, "PRICER"]),
             })
             o["VALUE_EUR"] = round(o["QTY"] * o["PRICER"], 2)
-            o["AFFECTED"] = (affected_deliveries(targets, s.MTRL, today, o["ARRIVAL"], level)
-                             if o["FLAG"] == TOO_LATE else [])
+            o["AFFECTED"], o["UNCOVERED"] = [], 0
+            if o["FLAG"] == LATE:
+                have = stock_until(s.QTY, incoming.get(int(s.MTRL)), o["ARRIVAL"])
+                o["AFFECTED"] = cover_deliveries(
+                    have, affected_deliveries(targets, s.MTRL, today, o["ARRIVAL"], level), rank)
+                o["UNCOVERED"] = len(uncovered(o["AFFECTED"]))
+                if o["UNCOVERED"]:
+                    o["FLAG"] = SHORT
             o["REASON"] = reason_text(o)
             rows.append(o)
     out = pd.DataFrame(rows)
     if len(out):
-        out["URGENT"] = out["FLAG"] == TOO_LATE
+        out["URGENT"] = out["FLAG"].map({SHORT: 2, LATE: 1}).fillna(0)
         out = out.sort_values(["ORDER_BY", "URGENT", "VALUE_EUR"], ascending=[True, False, False])
         out = out.drop(columns="URGENT").reset_index(drop=True)
     return out, stock
@@ -634,12 +738,19 @@ def group_reason(supplier_name, order_by, arrival, rows):
     text = (f"Από τον προμηθευτή «{supplier_name}» χρειάζονται {_items_text(len(rows))} με "
             f"παραγγελία έως {_dm(order_by)}, ώστε να φτάσουν {_dm(arrival)}. "
             + " ".join(_reason_head(r["payload"]) for r in rows))
-    short = [r for r in rows if r["flag"] == TOO_LATE]
+    def which(rs):
+        names = ", ".join(f"«{r['payload']['ITEM_NAME']}»" for r in rs)
+        return f"{'το' if len(rs) == 1 else 'τα'} {names}"
+
+    late = [r for r in rows if flag_state(r["flag"]) == LATE]
+    short = [r for r in rows if flag_state(r["flag"]) == SHORT]
+    if late:
+        text += (f" Αργήσαμε για {which(late)}: οι παραδόσεις σε πελάτες μέχρι την άφιξη "
+                 f"καλύπτονται, αλλά θα πέσουμε κάτω από το απόθεμα ασφαλείας.")
     if short:
-        n = sum(len(r["payload"].get("AFFECTED") or []) for r in short)
-        which = ", ".join(f"«{r['payload']['ITEM_NAME']}»" for r in short)
-        text += (f" Δεν φτάνουν εγκαίρως {'το' if len(short) == 1 else 'τα'} {which}, και "
-                 f"πριν την άφιξη επηρεάζονται {n} παραδόσεις σε πελάτες.")
+        n = sum(len(uncovered(r["payload"].get("AFFECTED"), r["flag"])) for r in short)
+        text += (f" Δεν φτάνει το απόθεμα για {which(short)}: {affected_phrase(n)} "
+                 f"πριν την άφιξη.")
     return text
 
 
@@ -664,10 +775,15 @@ def open_purchase_orders(days: int = 7, db=None, today=None) -> list[dict]:
     """Purchase suggestions still ΠΡΟΤΑΣΗ with ORDER_BY up to today + `days`, one dict per
     supplier and ORDER_BY, earliest first.
 
-    Keys: supplier_id, supplier_name, order_by, arrival, short (a line is ΔΕΝ_ΦΤΑΝΕΙ),
+    Keys: supplier_id, supplier_name, order_by, arrival,
+    status       "ΕΛΛΕΙΨΗ" (a line leaves customer deliveries uncovered), "ΑΡΓΗΣΑΜΕ" (a line
+                 was ordered too late, customers covered, under the safety stock) or "",
+    short        status == ΕΛΛΕΙΨΗ;  late: status == ΑΡΓΗΣΑΜΕ,
     total_value_eur (list price), reason, note (message to the supplier), note_source,
     lines [purchase_id, mtrl, item_name, qty, unit, value_eur, flags],
-    affected_deliveries [trdr, customer_name, date, qty, suggestion_id, mtrl, item_name].
+    affected_deliveries  ONLY the customer deliveries not covered (ΕΛΛΕΙΨΗ):
+                 [trdr, customer_name, date, qty, missing, suggestion_id, mtrl, item_name],
+    deliveries_before_arrival  all customer deliveries of the late lines until the arrival.
     The note is the one written by the last run (AI or template) while it still covers
     exactly the same lines, else the template.
     """
@@ -682,25 +798,31 @@ def open_purchase_orders(days: int = 7, db=None, today=None) -> list[dict]:
     for (supplier_id, order_by), g in _groups(rows).items():
         first = g[0]["payload"]
         arrival = max(r["arrival"] for r in g)
-        lines, affected = [], []
+        lines, affected, before = [], [], 0
         for r in g:
             p = r["payload"]
+            state = flag_state(r["flag"])
             lines.append({"purchase_id": r["id"], "mtrl": int(r["mtrl"]),
                           "item_name": p.get("ITEM_NAME"), "qty": int(r["qty"]),
                           "unit": p.get("UNIT"), "value_eur": r["value_eur"],
-                          "flags": [r["flag"]] if r["flag"] else []})
-            for a in p.get("AFFECTED") or []:
+                          "flags": [state] if state else []})
+            before += len(p.get("AFFECTED") or []) if state else 0
+            for a in uncovered(p.get("AFFECTED"), r["flag"]):
                 affected.append({"trdr": int(a["TRDR"]),
                                  "customer_name": names.get(int(a["TRDR"]), ""),
                                  "date": a["DELIVERY_DATE"], "qty": a["QTY"],
+                                 "missing": a.get("MISSING", a["QTY"]),
                                  "suggestion_id": a.get("SUGGESTION_ID"),
                                  "mtrl": int(r["mtrl"]), "item_name": p.get("ITEM_NAME")})
+        states = {flag_state(r["flag"]) for r in g}
+        status = SHORT if SHORT in states else LATE if LATE in states else ""
         group = {"supplier_id": supplier_id, "supplier_name": first.get("SUPPLIER_NAME"),
-                 "order_by": order_by, "arrival": arrival,
-                 "short": any(r["flag"] == TOO_LATE for r in g),
+                 "order_by": order_by, "arrival": arrival, "status": status,
+                 "short": status == SHORT, "late": status == LATE,
                  "total_value_eur": round(sum(r["value_eur"] or 0.0 for r in g), 2),
                  "reason": group_reason(first.get("SUPPLIER_NAME"), order_by, arrival, g),
-                 "lines": lines, "affected_deliveries": affected}
+                 "lines": lines, "affected_deliveries": affected,
+                 "deliveries_before_arrival": before}
         ids = sorted(r["id"] for r in g)
         stored = [r["payload"] for r in g if r["payload"].get("GROUP_IDS") == ids]
         if len(stored) == len(g) and stored[0].get("GROUP_NOTE"):
@@ -710,7 +832,8 @@ def open_purchase_orders(days: int = 7, db=None, today=None) -> list[dict]:
             group["note"] = llm.template_for(supplier_payload(group), "supplier")["note"]
             group["note_source"] = llm.TEMPLATE
         out.append(group)
-    return sorted(out, key=lambda o: (o["order_by"], not o["short"], -o["total_value_eur"]))
+    rank = {SHORT: 0, LATE: 1, "": 2}
+    return sorted(out, key=lambda o: (o["order_by"], rank[o["status"]], -o["total_value_eur"]))
 
 
 def _group_rows(supplier_id, order_by, db):
@@ -767,14 +890,16 @@ def write_group_notes(days=7, db=None, ai=True, today=None):
 # --- CLI --------------------------------------------------------------------
 
 def summary(orders, result, stock, top=10):
-    late = orders[orders["FLAG"] == TOO_LATE] if len(orders) else orders
+    late = orders[orders["FLAG"] == LATE] if len(orders) else orders
+    short = orders[orders["FLAG"] == SHORT] if len(orders) else orders
     value = float(orders["VALUE_EUR"].sum()) if len(orders) else 0.0
     src = stock["STOCK_SOURCE"].value_counts().to_dict()
     out = ["Ράφι · agent αποθήκης · προτάσεις αγοράς από προμηθευτές",
            f"Απόθεμα σήμερα: {src.get(FILE, 0)} είδη από αρχείο, {src.get(ESTIMATE, 0)} εκτίμηση",
            f"Προτάσεις αγοράς (90 ημέρες): {len(orders)}",
-           f"  ΔΕΝ_ΦΤΑΝΕΙ: {len(late)} (επηρεάζουν "
-           f"{sum(len(a) for a in late['AFFECTED']) if len(late) else 0} παραδόσεις σε πελάτες)",
+           f"  {SHORT}: {len(short)} (δεν καλύπτονται "
+           f"{int(short['UNCOVERED'].sum()) if len(short) else 0} παραδόσεις σε πελάτες)",
+           f"  {LATE}: {len(late)} (οι πελάτες καλύπτονται, κάτω από το απόθεμα ασφαλείας)",
            f"  Αξία (τιμή καταλόγου PRICER): {value:,.2f} €",
            f"  Αποθηκεύτηκαν νέες: {len(result['saved'])} · υπήρχαν ήδη: {result['skipped']}",
            "", f"Οι {top} πιο βιαστικές:",

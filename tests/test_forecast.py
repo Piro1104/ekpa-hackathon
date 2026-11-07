@@ -169,7 +169,8 @@ def _load_script():
 
 def test_submission_has_1975_rows_in_template_format(tmp_path):
     _load_script().main(tmp_path / "team_rafi.csv")
-    sub = pd.read_csv(tmp_path / "team_rafi.csv", dtype=str, keep_default_na=False)
+    sub = pd.read_csv(tmp_path / "team_rafi.csv", encoding="utf-8", dtype=str,
+                      keep_default_na=False)
     template = pd.read_csv(DATA / "submission_template.csv", encoding="utf-8-sig",
                            dtype=str, keep_default_na=False)
     assert len(sub) == 1975
@@ -179,7 +180,7 @@ def test_submission_has_1975_rows_in_template_format(tmp_path):
     assert sub.loc[has_date, "SUGGESTED_QTY"].str.fullmatch(r"[1-9]\d*").all()
     assert (sub.loc[~has_date, "SUGGESTED_QTY"] == "").all()
 
-    details = pd.read_csv(tmp_path / "forecast_details.csv")
+    details = pd.read_csv(tmp_path / "forecast_details.csv", encoding="utf-8")
     assert len(details) == 1975
     assert {"BASE_RATE", "SEASONAL_FACTOR_NOW", "STOCK_AT_CUTOFF", "REASON_CODE",
             "CONFIDENCE"} <= set(details.columns)

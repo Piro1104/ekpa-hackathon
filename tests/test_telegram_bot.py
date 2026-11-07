@@ -1,4 +1,5 @@
 """Telegram bot with a fake Telegram API and a fake ERP: no real network calls."""
+import json
 import sys
 import types
 
@@ -160,12 +161,90 @@ def test_brief_with_orchestrator_and_warehouse(db, monkeypatch):
     msgs = tb.brief_messages(path)
     assert len(msgs) == 4
     assert "Προς έγκριση: 9" in msgs[0][0] and "Αξία σε κίνδυνο: 1.234,50 €" in msgs[0][0]
-    assert "Ελλείψεις: 1" in msgs[0][0]
+    assert "Ελλείψεις (δεν καλύπτονται πελάτες): 1" in msgs[0][0]
+    assert "Αργήσαμε (πελάτες καλυμμένοι): 0" in msgs[0][0]  # no late_count: counted
     assert "(1)" in msgs[1][0]
     text, kb = msgs[3]
     assert "Προμηθευτής Νερών Α.Ε.: έως Τρ. 03/11/2026 · 500,00 € · έλλειψη" in text
     assert "Αναψυκτικά" not in text  # outside the 7 days
     assert kb[0][0]["callback_data"] == "p:SUP01:2026-11-03"
+
+
+def _real_warehouse(path):
+    """Purchase suggestions as the warehouse agent saves them: one ΕΛΛΕΙΨΗ with 2 of its 3
+    customer deliveries not covered, one ΑΡΓΗΣΑΜΕ with 11 covered, one normal order."""
+    from rafi.agents import warehouse_agent as wa
+
+    def row(mtrl, sup, flag="", affected=(), name="Είδος"):
+        return {"MTRL": mtrl, "SUPPLIER_ID": sup, "SUPPLIER_NAME": f"Προμηθευτής {sup} Α.Ε.",
+                "ORDER_BY": "2026-11-02", "ARRIVAL": "2026-11-09", "QTY": 36,
+                "VALUE_EUR": 460.8, "FLAG": flag, "ITEM_NAME": name, "UNIT": "τεμ.",
+                "STOCK_NOW": 3, "STOCKOUT_DATE": "2026-11-05", "BREACH_DATE": "2026-11-03",
+                "SAFETY_STOCK": 17, "AFFECTED": list(affected), "REASON": f"Λόγος {name}."}
+
+    def a(trdr, missing):
+        return {"TRDR": trdr, "MTRL": 5075, "DELIVERY_DATE": "2026-11-04", "QTY": 2.0,
+                "SUGGESTION_ID": None, "MISSING": missing}
+    store.save_purchase_new([
+        row(5075, "S07", wa.SHORT, [a(1036, 0.0), a(1123, 2.0), a(1010, 1.0)], "Λαμπρυντικό"),
+        row(5076, "S08", wa.LATE, [a(1000 + i, 0.0) for i in range(11)], "Μαλακτικό"),
+        row(5059, "S05", name="Χαρτί υγείας")], db=path)
+
+
+def test_brief_with_the_real_orchestrator_summary(db, monkeypatch):
+    path, _ = db
+    _real_warehouse(path)
+    monkeypatch.delitem(sys.modules, "rafi.agents.orchestrator")  # the real module
+    from rafi.agents import orchestrator
+    summary = orchestrator.morning_summary(db=path)
+    w = summary["warehouse"]
+    assert set(summary["customers"]) == {"counts", "value_at_risk_eur", "offers_value_eur",
+                                         "needs_you"}
+    assert set(w) >= {"orders_count", "short_count", "orders"}
+    assert set(w["orders"][0]) >= {"supplier_id", "supplier_name", "order_by", "arrival",
+                                   "status", "short", "total_value_eur", "reason", "note",
+                                   "lines", "affected_deliveries"}
+    groups = tb.supplier_orders(w)
+    assert [(g["supplier_id"], g["status"], g["uncovered"]) for g in groups] == \
+        [("S07", "ΕΛΛΕΙΨΗ", 2), ("S08", "ΑΡΓΗΣΑΜΕ", 0), ("S05", "", 0)]
+    assert groups[0]["value_eur"] == 460.8 and groups[0]["arrival"] == "2026-11-09"
+    assert groups[1]["before_arrival"] == 11 and groups[0]["note"]
+
+    msgs = tb.brief_messages(path)
+    assert "Ελλείψεις (δεν καλύπτονται πελάτες): 1" in msgs[0][0]
+    assert "Αργήσαμε (πελάτες καλυμμένοι): 1" in msgs[0][0]
+    text = msgs[3][0]
+    assert "Προμηθευτής S07 Α.Ε.: έως Δευτ. 02/11/2026 · 460,80 € · έλλειψη, επηρεάζονται 2 " \
+           "παραδόσεις σε πελάτες" in text
+    assert "Προμηθευτής S08 Α.Ε.: έως Δευτ. 02/11/2026 · 460,80 € · αργήσαμε (οι πελάτες " \
+           "καλύπτονται)" in text
+    assert "Προμηθευτής S05 Α.Ε.: έως Δευτ. 02/11/2026 · 460,80 €\n" in text + "\n"
+
+
+def test_open_purchase_shows_status_and_note(db):
+    path, _ = db
+    _real_warehouse(path)
+    api = FakeApi()
+    bot = tb.Bot(api, CFG, path)
+    press(bot, "p:S07:2026-11-02")
+    text = api.texts()[-1]
+    assert "Έλλειψη: επηρεάζονται 2 παραδόσεις σε πελάτες" in text
+    assert "Μπαρ Πέτρα" in text and "Mini Market Ήλιος" not in text  # covered: not listed
+    assert "Μήνυμα προς τον προμηθευτή" in text and "36 τεμ. «Λαμπρυντικό»" in text
+    press(bot, "p:S08:2026-11-02")
+    text = api.texts()[-1]
+    assert "Αργήσαμε." in text and "Οι 11 παραδόσεις σε πελάτες" in text
+    assert "επηρεάζ" not in text.lower()
+
+
+def test_supplier_orders_old_shape_and_status():
+    old = {"orders": [{"supplier_id": "S1", "order_by": "2026-11-02", "value_eur": 5,
+                       "flag": "ΔΕΝ_ΦΤΑΝΕΙ"},
+                      {"supplier_id": "S2", "order_by": "2026-11-02", "short": False,
+                       "lines": [{"flags": ["ΑΡΓΗΣΑΜΕ"]}]}]}
+    assert [(g["supplier_id"], g["status"]) for g in tb.supplier_orders(old)] == \
+        [("S1", "ΕΛΛΕΙΨΗ"), ("S2", "ΑΡΓΗΣΑΜΕ")]
+    assert tb.supplier_orders(None) == []
 
 
 def test_send_brief_goes_to_the_admin_only(db):
@@ -404,14 +483,16 @@ def test_purchase_uses_the_warehouse_functions_when_present(db, monkeypatch):
     calls = []
     import rafi.agents.warehouse_agent as wa
     monkeypatch.setattr(wa, "approve_purchase_order",
-                        lambda s, o, u: calls.append(("ok", s, o, u)), raising=False)
+                        lambda s, o, u, db=None: calls.append(("ok", s, o, u, db)), raising=False)
     monkeypatch.setattr(wa, "reject_purchase_order",
-                        lambda s, o, r, u: calls.append(("no", s, o, r, u)), raising=False)
+                        lambda s, o, r, u, db=None: calls.append(("no", s, o, r, u, db)),
+                        raising=False)
+    purchases(path)
     bot = tb.Bot(FakeApi(), CFG, path)
     press(bot, "pa:SUP01:2026-11-03")
     press(bot, "prr:SUP01:2026-11-03:0")
-    assert calls == [("ok", "SUP01", "2026-11-03", "telegram"),
-                     ("no", "SUP01", "2026-11-03", "Υπάρχει ακόμα απόθεμα", "telegram")]
+    assert calls == [("ok", "SUP01", "2026-11-03", "telegram", path),
+                     ("no", "SUP01", "2026-11-03", "Υπάρχει ακόμα απόθεμα", "telegram", path)]
 
 
 def test_purchase_reject_fallback_with_other_reason(db):
@@ -424,3 +505,197 @@ def test_purchase_reject_fallback_with_other_reason(db):
     assert {r["status"] for r in rows} == {store.REJECTED}
     assert store.purchase_history(rows[0]["id"], db=path)[-1]["details"] == {
         "reason": "Άλλο — Αλλάζουμε προμηθευτή"}
+
+
+def test_customer_text_does_not_repeat_the_list_of_an_ai_note(monkeypatch):
+    from rafi import llm
+    monkeypatch.setenv("LLM_MODE", "mock")
+    s = {"trdr": 1001, "delivery_date": "2026-11-04", "payload": {
+        **suggestion(1001, 5016)["payload"], "TEXT_SOURCE": "AI"}}
+    s["payload"]["SALES_NOTE"] = llm.write_texts(s["payload"], "customer")["note"]
+    text = tb.customer_text(s)
+    assert text.count(llm.ITEMS_HEADER) == 1 and "Προτεινόμενη παράδοση" in text
+    assert "βοήθεια AI" in text
+    # a template note keeps the date and items added by the bot
+    s["payload"].update(SALES_NOTE="Καλημέρα σας.", TEXT_SOURCE="ΠΡΟΤΥΠΟ")
+    assert tb.customer_text(s).count(llm.ITEMS_HEADER) == 1
+
+
+# --- message to the supplier after a purchase approval ----------------------------
+
+SUPPLIER_CFG = {**CFG, "TELEGRAM_SUPPLIER_CHAT_ID": "333"}
+
+
+def _approved_purchase(path, tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "PURCHASE_DIR", tmp_path / "po")
+    _real_warehouse(path)
+    from rafi.agents import warehouse_agent as wa
+    wa.approve_purchase_order("S07", "2026-11-02", "admin", db=path)
+
+
+def test_notify_supplier_sends_once(db, tmp_path, monkeypatch):
+    path, _ = db
+    _approved_purchase(path, tmp_path, monkeypatch)
+    message_mode(True)
+    api = FakeApi()
+    assert tb.supplier_notice("S07", "2026-11-02", api, SUPPLIER_CFG, path) == (True, "")
+    [msg] = api.sent("333")
+    lines = msg["text"].split("\n")
+    assert lines[0] == "Προς: Προμηθευτής S07 Α.Ε."
+    assert "Είδη:\n• Λαμπρυντικό: 36 τεμ.\nΠαράδοση έως: Δευτέρα 9/11/2026" in msg["text"]
+    assert not api.sent(ADMIN) and not api.sent(CUSTOMER)
+    hist = [e for e in store.purchase_history(db=path) if e["action"] == tb.SUPPLIER_MESSAGE]
+    assert len(hist) == 1 and hist[0]["user"] == "telegram"
+    # never a second time for the same order
+    ok, why = tb.supplier_notice("S07", "2026-11-02", api, SUPPLIER_CFG, path)
+    assert not ok and "ήδη" in why and len(api.sent("333")) == 1
+
+
+def test_notify_supplier_needs_the_setting_and_an_approved_order(db, tmp_path, monkeypatch):
+    path, _ = db
+    _approved_purchase(path, tmp_path, monkeypatch)
+    api = FakeApi()
+    message_mode(False)
+    assert tb.supplier_notice("S07", "2026-11-02", api, SUPPLIER_CFG, path)[0] is False
+    message_mode(True)
+    ok, why = tb.supplier_notice("S08", "2026-11-02", api, SUPPLIER_CFG, path)  # not approved
+    assert not ok and "εγκριθεί" in why
+    assert api.sent() == []
+
+
+def test_notify_supplier_without_chat_id_is_a_clear_message(db, tmp_path, monkeypatch):
+    path, _ = db
+    _approved_purchase(path, tmp_path, monkeypatch)
+    message_mode(True)
+    for k in tb.KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(tb, "_read_dotenv", lambda path: {})
+    api = FakeApi()
+    assert tb.supplier_notice("S07", "2026-11-02", api, CFG, path) == \
+        (False, "λείπει το TELEGRAM_SUPPLIER_CHAT_ID στο .env")
+    assert tb.notify_supplier("S07", "2026-11-02", db=path) is False  # no exception
+    assert api.sent() == []
+
+
+def test_bot_approval_messages_the_supplier(db, tmp_path, monkeypatch):
+    path, _ = db
+    monkeypatch.setattr(store, "PURCHASE_DIR", tmp_path / "po")
+    _real_warehouse(path)
+    message_mode(True)
+    api = FakeApi()
+    bot = tb.Bot(api, SUPPLIER_CFG, path)
+    press(bot, "pa:S07:2026-11-02")
+    assert api.texts(ADMIN)[-1] == "Η παραγγελία προμηθευτή εγκρίθηκε. Ο προμηθευτής ενημερώθηκε."
+    assert len(api.sent("333")) == 1
+    # without a supplier chat: approved, with a clear reason
+    api = FakeApi()
+    press(tb.Bot(api, CFG, path), "pa:S08:2026-11-02")
+    assert api.texts(ADMIN)[-1] == ("Η παραγγελία προμηθευτή εγκρίθηκε. Το μήνυμα στον "
+                                    "προμηθευτή δεν στάλθηκε: λείπει το "
+                                    "TELEGRAM_SUPPLIER_CHAT_ID στο .env.")
+
+
+def test_supplier_replies_reach_the_admin(db):
+    path, _ = db
+    api = FakeApi()
+    tb.Bot(api, SUPPLIER_CFG, path).handle(
+        {"update_id": 1, "message": {"text": "Εντάξει, έρχονται Δευτέρα", "chat": {"id": 333}}})
+    assert "Ο προμηθευτής του demo απάντησε" in api.texts(ADMIN)[-1]
+
+
+def test_whoami_roles():
+    assert tb.role_text(333, SUPPLIER_CFG) == "  ← προμηθευτής demo"
+    assert tb.role_text(111, SUPPLIER_CFG) == "  ← Διαχειριστής"
+    assert tb.role_text(9, SUPPLIER_CFG) == ""
+
+
+# --- free question of the Administrator ------------------------------------------
+
+def say(bot, text, chat=ADMIN):
+    return bot.handle({"update_id": 1, "message": {"text": text, "chat": {"id": int(chat)}}})
+
+
+@pytest.mark.parametrize("question", ["Με ποιον να ξεκινήσω σήμερα;",
+                                      "Τι παραγγέλνουμε αυτή την εβδομάδα;",
+                                      "Πόση είναι η αξία σε κίνδυνο;"])
+def test_free_question_goes_to_the_assistant(db, monkeypatch, question):
+    path, _ = db
+    monkeypatch.setenv("LLM_MODE", "mock")
+    api = FakeApi()
+    say(tb.Bot(api, CFG, path), question)
+    text = api.texts(ADMIN)[-1]
+    assert text.startswith("[MOCK]") and f"«{question}»" in text
+    assert text.endswith(f"<i>({tb.h.AI_BADGE})</i>")
+
+
+def test_question_context_has_summary_needs_you_and_the_week(db, monkeypatch):
+    path, ids = db
+    _real_warehouse(path)
+    monkeypatch.delitem(sys.modules, "rafi.agents.orchestrator")  # the real orchestrator
+    from rafi import llm
+    seen = {}
+
+    def fake_answer(question, context):
+        seen.update(q=question, ctx=context)
+        return {"text": "Ξεκίνα από το Hotel Ιόνιο (250,00 €).", "source": llm.AI}
+    monkeypatch.setattr(llm, "answer", fake_answer)
+    api = FakeApi()
+    say(tb.Bot(api, CFG, path), "Με ποιον να ξεκινήσω σήμερα;")
+    assert api.texts(ADMIN)[-1].startswith("Ξεκίνα από το Hotel Ιόνιο (250,00 €).")
+    ctx = seen["ctx"]
+    assert ctx["πελάτες"]["προς_έγκριση"] == 5 and ctx["πελάτες"]["αξία_σε_κίνδυνο_eur"] == 510.5
+    needs = ctx["χρειάζονται_εσένα"]
+    assert needs[0]["πελάτης"] == "Hotel Ιόνιο Μ.Ε.Π.Ε."
+    assert set(needs[0]) == {"πελάτης", "κωδικός", "τύπος", "παράδοση", "αξία_eur", "φράση"}
+    assert needs[0]["φράση"] == "Το νερό τελειώνει περίπου 6/11"
+    week = ctx["παραγγελίες_αποθήκης_εβδομάδας"]
+    assert [(o["προμηθευτής"], o["κατάσταση"]) for o in week] == [
+        ("Προμηθευτής S07 Α.Ε.", "Έλλειψη"), ("Προμηθευτής S08 Α.Ε.", "Αργήσαμε"),
+        ("Προμηθευτής S05 Α.Ε.", "κανονική")]
+    assert week[0]["αξία_eur"] == 460.8 and week[0]["πελάτες_που_δεν_καλύπτονται"] == 2
+    assert ctx["αποθήκη"] == {"παραγγελίες_εβδομάδας": 3, "ελλείψεις": 1, "αργήσαμε": 1}
+    json.dumps(ctx, ensure_ascii=False)
+
+
+def test_assistant_down_gives_a_short_message(db, monkeypatch):
+    path, _ = db
+    from rafi import llm
+    monkeypatch.setenv("LLM_MODE", "local")
+
+    def down(*a, **k):
+        raise llm.requests.ConnectionError("no ollama")
+    monkeypatch.setattr(llm.requests, "post", down)  # never a real Ollama
+    api = FakeApi()
+    say(tb.Bot(api, CFG, path), "Πόση είναι η αξία σε κίνδυνο;")
+    assert api.texts(ADMIN)[-1] == tb.ASSISTANT_DOWN
+    monkeypatch.setattr(llm, "answer", lambda q, c: 1 / 0)
+    say(tb.Bot(api, CFG, path), "Τι παραγγέλνουμε;")
+    assert api.texts(ADMIN)[-1] == tb.ASSISTANT_DOWN
+
+
+def test_only_the_admin_text_goes_to_the_assistant(db, monkeypatch):
+    path, ids = db
+    from rafi import llm
+    monkeypatch.setattr(llm, "answer", lambda q, c: pytest.fail("no AI for this message"))
+    api = FakeApi()
+    bot = tb.Bot(api, SUPPLIER_CFG, path)
+    say(bot, "Θέλουμε και νερά", CUSTOMER)
+    assert api.texts(ADMIN)[-1] == "Ο πελάτης του demo απάντησε:\n«Θέλουμε και νερά»"
+    say(bot, "Έρχονται Δευτέρα", "333")
+    assert api.texts(ADMIN)[-1] == "Ο προμηθευτής του demo απάντησε:\n«Έρχονται Δευτέρα»"
+    say(bot, "κάτι", "999")  # unknown chat: ignored
+    assert len(api.sent()) == 2
+    # after «Ρώτα» on a suggestion the question is about that suggestion
+    calls = []
+    monkeypatch.setattr(tb.h, "ask_assistant", lambda q, c: calls.append(q) or
+                        {"text": "Για την πρόταση.", "source": "AI"})
+    press(bot, f"q:{ids[0]}")
+    say(bot, "Γιατί έκτακτο;")
+    assert calls == ["Γιατί έκτακτο;"] and api.texts(ADMIN)[-1].startswith("Για την πρόταση.")
+
+
+def test_brief_invites_questions(db):
+    path, _ = db
+    first = tb.brief_messages(path)[0][0]
+    assert first.rstrip().endswith(
+        "Μπορείς να μου γράψεις και ερώτηση, π.χ. \"Με ποιον να ξεκινήσω σήμερα;\"")

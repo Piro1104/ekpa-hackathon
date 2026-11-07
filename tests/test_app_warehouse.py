@@ -9,11 +9,12 @@ from app import warehouse as wh
 
 SHORT = {
     "supplier_id": "S07", "supplier_name": "Προμηθευτής Απορρυπαντικών Α.Ε.",
-    "order_by": "2026-11-02", "arrival": pd.Timestamp("2026-11-09"), "short": True,
+    "order_by": "2026-11-02", "arrival": pd.Timestamp("2026-11-09"), "status": "ΕΛΛΕΙΨΗ",
+    "short": True, "late": False, "deliveries_before_arrival": 11,
     "total_value_eur": 460.8, "reason": "Το «Λαμπρυντικό» τελειώνει περίπου 17/11.",
     "note": "Καλημέρα σας.",
     "lines": [{"purchase_id": 1, "mtrl": 5075, "item_name": "Λαμπρυντικό πλυντηρίου 5L",
-               "qty": 36, "unit": "τεμ.", "value_eur": 460.8, "flags": ["ΔΕΝ_ΦΤΑΝΕΙ"]}],
+               "qty": 36, "unit": "τεμ.", "value_eur": 460.8, "flags": ["ΕΛΛΕΙΨΗ"]}],
     "affected_deliveries": [
         {"trdr": 1036, "customer_name": "Mini Market Ήλιος", "date": "2026-11-03", "qty": 3,
          "suggestion_id": 1},
@@ -24,7 +25,8 @@ SHORT = {
 }
 PAPER = {
     "supplier_id": "S05", "supplier_name": "Προμηθευτής Χαρτικών Α.Ε.", "order_by": "2026-11-06",
-    "arrival": "2026-11-14", "short": False, "total_value_eur": 1551.5, "reason": "", "note": "",
+    "arrival": "2026-11-14", "status": "", "short": False, "late": False,
+    "total_value_eur": 1551.5, "reason": "", "note": "",
     "lines": [{"purchase_id": 2, "mtrl": 5059, "item_name": "Χαρτί υγείας 48 ρολά", "qty": 91,
                "unit": "κιβ.", "value_eur": 1319.5, "flags": []},
               {"purchase_id": 3, "mtrl": 5064, "item_name": "Μεμβράνη τροφίμων", "qty": 40,
@@ -37,17 +39,41 @@ COFFEE = {**PAPER, "supplier_id": "S02", "supplier_name": "Προμηθευτή�
                      "qty": 73, "unit": "τεμ.", "value_eur": 4526.0, "flags": []}]}
 
 
-def test_short_orders_come_first_then_by_day():
-    assert [o["supplier_id"] for o in wh.sort_orders([PAPER, COFFEE, SHORT])] == \
-        ["S07", "S02", "S05"]
+# the real case of 1/11: 44 units in stock, 27 for the 11 deliveries until 9/11
+LATE = {**SHORT, "status": "ΑΡΓΗΣΑΜΕ", "short": False, "late": True, "supplier_id": "S08",
+        "lines": [{**SHORT["lines"][0], "flags": ["ΑΡΓΗΣΑΜΕ"]}], "affected_deliveries": []}
+
+
+def test_short_orders_come_first_then_late_then_by_day():
+    assert [o["supplier_id"] for o in wh.sort_orders([PAPER, COFFEE, LATE, SHORT])] == \
+        ["S07", "S08", "S02", "S05"]
 
 
 def test_metrics():
     m = wh.metrics([SHORT, PAPER, COFFEE])
-    assert m == {"orders": 3, "short_items": 1, "short_deliveries": 3,
+    assert m == {"orders": 3, "short_items": 1, "short_deliveries": 3, "late_items": 0,
                  "value_eur": round(460.8 + 1551.5 + 4526.0, 2)}
     assert wh.metrics([]) == {"orders": 0, "short_items": 0, "short_deliveries": 0,
-                              "value_eur": 0}
+                              "late_items": 0, "value_eur": 0}
+    m = wh.metrics([LATE, PAPER])
+    assert m["short_items"] == 0 and m["short_deliveries"] == 0 and m["late_items"] == 1
+
+
+def test_status_and_tags():
+    assert wh.status(SHORT) == "ΕΛΛΕΙΨΗ" and wh.tag_of(SHORT) == ("Έλλειψη", "short")
+    assert wh.status(LATE) == "ΑΡΓΗΣΑΜΕ" and wh.tag_of(LATE) == ("Αργήσαμε", "late")
+    assert wh.status(PAPER) == "" and wh.tag_of(PAPER) == ("Αγορά", "buy")
+    old = {k: v for k, v in SHORT.items() if k != "status"}  # only "short", as before
+    assert wh.status(old) == "ΕΛΛΕΙΨΗ"
+    assert wh.short_lines(LATE) == [] and wh.late_lines(LATE) == LATE["lines"]
+
+
+def test_late_text_says_customers_are_covered():
+    assert wh.late_text(LATE) == (
+        "Οι 11 παραδόσεις σε πελάτες μέχρι την άφιξη καλύπτονται από το απόθεμα, αλλά θα "
+        "πέσουμε κάτω από το απόθεμα ασφαλείας. Παράγγειλε σήμερα.")
+    assert wh.affected_phrase(3) == "Επηρεάζονται 3 παραδόσεις σε πελάτες"
+    assert wh.affected_phrase(1) == "Επηρεάζεται 1 παράδοση σε πελάτη"
 
 
 def test_card_lines():
@@ -80,7 +106,10 @@ def test_affected_deliveries_text_in_date_order():
 def test_home_sentences():
     s = wh.home_sentence(SHORT)
     assert "Λαμπρυντικό πλυντηρίου 5L" in s and "36 τεμ." in s
-    assert "τη Δευτέρα 2/11" in s and "9/11" in s and "3 παραδόσεις" in s
+    assert "τη Δευτέρα 2/11" in s and "9/11" in s and "επηρεάζονται 3 παραδόσεις" in s
+    s = wh.home_sentence(LATE)
+    assert s.startswith("Αργήσαμε για: <b>Λαμπρυντικό πλυντηρίου 5L</b>")
+    assert "Οι πελάτες καλύπτονται" in s and "επηρεάζ" not in s
     s = wh.home_sentence(COFFEE)
     assert s.startswith("<b>Προμηθευτής Καφέ Ο.Ε.:</b> 73 τεμ. Στιγμιαίος καφές 200g")
     assert "έως Δευτέρα 2/11" in s

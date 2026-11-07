@@ -1,8 +1,11 @@
 """Plain functions behind the Αποθήκη page (no Streamlit here, so they are testable).
 
 The orders come from rafi.agents.warehouse_agent.open_purchase_orders(): one dict per
-supplier and order day, with its lines and, when the stock runs out before the goods
-arrive (short), the customer deliveries it affects.
+supplier and order day, with its lines and a status:
+  ΕΛΛΕΙΨΗ   ordered too late and some customer deliveries before the arrival are not
+            covered (affected_deliveries lists only those)
+  ΑΡΓΗΣΑΜΕ  ordered too late, the customers are covered, but we drop under the safety stock
+  ""        a normal order
 """
 import html
 import importlib
@@ -14,7 +17,9 @@ from app import helpers as h
 SOON = "Ο έλεγχος αποθήκης ενεργοποιείται σύντομα"
 WEEK_DAYS = 7
 ALL_DAYS = 90
-TOO_LATE = "ΔΕΝ_ΦΤΑΝΕΙ"
+SHORT, LATE = "ΕΛΛΕΙΨΗ", "ΑΡΓΗΣΑΜΕ"
+OLD_TOO_LATE = "ΔΕΝ_ΦΤΑΝΕΙ"  # older stores, read as ΕΛΛΕΙΨΗ
+TAGS = {SHORT: ("Έλλειψη", "short"), LATE: ("Αργήσαμε", "late"), "": ("Αγορά", "buy")}
 
 
 def agent():
@@ -35,34 +40,82 @@ def order_key(o):
     return f"{o.get('supplier_id')}|{t:%Y-%m-%d}" if t is not None else str(o.get("supplier_id"))
 
 
+def status(o):
+    """ΕΛΛΕΙΨΗ, ΑΡΓΗΣΑΜΕ or "" (an order without "status" falls back to "short")."""
+    s = o.get("status")
+    if s in (SHORT, LATE, ""):
+        return s
+    if s == OLD_TOO_LATE or o.get("short"):
+        return SHORT
+    return LATE if o.get("late") else ""
+
+
+def tag_of(o):
+    """(text, css kind) of the order's tag: Έλλειψη / Αργήσαμε / Αγορά."""
+    return TAGS[status(o)]
+
+
 def sort_orders(orders):
-    """Short ones first, then by order day, then the most valuable."""
+    """Shortages first, then late orders, then by order day and the most valuable."""
+    rank = {SHORT: 0, LATE: 1, "": 2}
+
     def key(o):
         t = h._to_date(o.get("order_by"))
-        return (not o.get("short"), t if t is not None else pd.Timestamp.max,
+        return (rank[status(o)], t if t is not None else pd.Timestamp.max,
                 -float(o.get("total_value_eur") or 0))
     return sorted(orders, key=key)
 
 
-def short_lines(o):
-    """Lines that do not arrive in time: the ones marked ΔΕΝ_ΦΤΑΝΕΙ, else all lines of a
-    short order."""
-    if not o.get("short"):
+def _marked(o, state):
+    if status(o) != state:
         return []
     lines = o.get("lines") or []
-    marked = [l for l in lines if TOO_LATE in (l.get("flags") or [])]
+    flags = {state, OLD_TOO_LATE} if state == SHORT else {state}
+    marked = [l for l in lines if flags & set(l.get("flags") or [])]
     return marked or lines
 
 
+def short_lines(o):
+    """Lines that leave customer deliveries uncovered (ΕΛΛΕΙΨΗ)."""
+    return _marked(o, SHORT)
+
+
+def late_lines(o):
+    """Lines ordered too late while the customers are still covered (ΑΡΓΗΣΑΜΕ)."""
+    return _marked(o, LATE)
+
+
 def metrics(orders):
-    """Numbers at the top of the page (for the orders of the week)."""
-    short = [o for o in orders if o.get("short")]
+    """Numbers at the top of the page (for the orders of the week).
+
+    short_deliveries counts only the customer deliveries that are not covered.
+    """
+    short = [o for o in orders if status(o) == SHORT]
     return {
         "orders": len(orders),
         "short_items": len({l.get("mtrl") for o in short for l in short_lines(o)}),
         "short_deliveries": sum(len(o.get("affected_deliveries") or []) for o in short),
+        "late_items": len({l.get("mtrl") for o in orders for l in late_lines(o)}),
         "value_eur": round(sum(float(o.get("total_value_eur") or 0) for o in orders), 2),
     }
+
+
+def affected_phrase(n):
+    """'Επηρεάζεται 1 παράδοση σε πελάτη' / 'Επηρεάζονται 3 παραδόσεις σε πελάτες'."""
+    return ("Επηρεάζεται 1 παράδοση σε πελάτη" if n == 1
+            else f"Επηρεάζονται {n} παραδόσεις σε πελάτες")
+
+
+def late_text(o):
+    """Panel text of an ΑΡΓΗΣΑΜΕ order: customers covered, under the safety stock."""
+    n = int(o.get("deliveries_before_arrival") or 0)
+    if n == 0:
+        cover = "Μέχρι την άφιξη δεν έχουμε παραδόσεις σε πελάτες"
+    elif n == 1:
+        cover = "Η 1 παράδοση σε πελάτη μέχρι την άφιξη καλύπτεται από το απόθεμα"
+    else:
+        cover = f"Οι {n} παραδόσεις σε πελάτες μέχρι την άφιξη καλύπτονται από το απόθεμα"
+    return f"{cover}, αλλά θα πέσουμε κάτω από το απόθεμα ασφαλείας. Παράγγειλε σήμερα."
 
 
 def _qty_unit(line):
@@ -111,12 +164,18 @@ def home_sentence(o):
     supplier = html.escape(str(o.get("supplier_name") or o.get("supplier_id")))
     when = h.day_phrase(o.get("order_by"))
     arrival = h.dm(o.get("arrival"))
-    if o.get("short"):
+    state = status(o)
+    qty = (f"{_qty_unit(lines[0])} " if len(lines) == 1 else "")
+    if state == SHORT:
         names = ", ".join(f"<b>{html.escape(str(l.get('item_name')))}</b>" for l in short_lines(o))
         n = len(o.get("affected_deliveries") or [])
-        qty = (f"{_qty_unit(lines[0])} " if len(lines) == 1 else "")
         return (f"Δεν φτάνει το απόθεμα για: {names}. Παράγγειλε {qty}από τον {supplier} "
-                f"{when}, για να φτάσουν {arrival}· επηρεάζονται {n} παραδόσεις σε πελάτες.")
+                f"{when}, για να φτάσουν {arrival}· {affected_phrase(n).lower()}.")
+    if state == LATE:
+        names = ", ".join(f"<b>{html.escape(str(l.get('item_name')))}</b>" for l in late_lines(o))
+        return (f"Αργήσαμε για: {names}. Οι πελάτες καλύπτονται, αλλά πέφτουμε κάτω από το "
+                f"απόθεμα ασφαλείας. Παράγγειλε {qty}από τον {supplier} {when}, για να φτάσουν "
+                f"{arrival}.")
     what = (f"{_qty_unit(lines[0])} {html.escape(str(lines[0].get('item_name')))}"
             if len(lines) == 1 else h.items_count(len(lines)))
     return f"<b>{supplier}:</b> {what}, παραγγελία έως {when.split(' ', 1)[1]}, φτάνει {arrival}."

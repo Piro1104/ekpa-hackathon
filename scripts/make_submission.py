@@ -74,9 +74,9 @@ def main(out_path=ROOT / "submissions" / "team_rafi.csv", method=DEFAULT_METHOD)
     filled = check(sub, template)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sub.to_csv(out_path, index=False)
+    sub.to_csv(out_path, index=False, encoding="utf-8")
     details_path = out_path.parent / "forecast_details.csv"
-    details.to_csv(details_path, index=False, date_format="%Y-%m-%d")
+    details.to_csv(details_path, index=False, date_format="%Y-%m-%d", encoding="utf-8")
 
     print(f"Ράφι · υποβολή (μέθοδος {method}, cutoff 2026-10-31)")
     print(f"  Ζεύγη:                     {len(sub):>5,}")

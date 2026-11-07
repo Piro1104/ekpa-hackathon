@@ -90,6 +90,9 @@ def test_users():
     assert h.store_user({"salesman": 103}) == "admin"
     assert h.user_label(h.store_user()) == "Διαχειριστής"
     assert h.user_label("system") == "Σύστημα"
+    assert h.user_label("telegram") == "Διαχειριστής (Telegram)"
+    assert h.user_label("orchestrator") == "Σύστημα (συντονιστής)"
+    assert h.user_label("warehouse_agent") == "Σύστημα (αποθήκη)"
     assert h.user_label("103", {103: "Ελένη"}) == "Ελένη"
 
 
@@ -277,3 +280,46 @@ def test_summary_does_not_stop_inside_an_item_name():
     assert h.summary(s) == "Το «Νερό 0,75L γυάλινο κιβ. 12τεμ» τελειώνει περίπου 3/11"
     s = make(reason="Ο πελάτης παρήγγελνε κάθε ~5 ημέρες. Αγορές 12 μηνών: 3.000 €.")
     assert h.summary(s) == "Ο πελάτης παρήγγελνε κάθε ~5 ημέρες"
+
+
+def test_history_has_customers_and_warehouse_together(tmp_path):
+    db = tmp_path / "t.db"
+    s = make()
+    store.save_new([{"ACTION_TYPE": s["action_type"], "VALUE_EUR": 10.0, "PRIORITY": 1,
+                     "FLAGS": [], "payload": s["payload"]}], db=db)
+    pids = store.save_purchase_new([
+        {"MTRL": m, "ITEM_NAME": n, "UNIT": "κιβ.", "SUPPLIER_ID": "SUP07",
+         "SUPPLIER_NAME": "Προμηθευτής Χαρτικών Α.Ε.", "ORDER_BY": "2026-11-06",
+         "ARRIVAL": "2026-11-14", "QTY": q, "VALUE_EUR": 10.0, "FLAG": f, "AFFECTED": []}
+        for m, n, q, f in [(5059, "Χαρτί υγείας", 91, "ΑΡΓΗΣΑΜΕ"), (5064, "Μεμβράνη", 40, "")]],
+        db=db)["saved"]
+    store.correct(1, 5001, 6, "103", db=db)
+    store.approve_purchase(pids[0], "admin", db=db, out_dir=tmp_path / "po")
+    store.reject_purchase(pids[1], "Έχουμε απόθεμα", "telegram", db=db)
+    with store._purchase_transaction(db) as conn:
+        store._purchase_log(conn, pids[0], "telegram", "ΜΗΝΥΜΑ_ΠΡΟΜΗΘΕΥΤΗ", {"Κανάλι": "Telegram"})
+
+    rows = h.merge_history(
+        h.history_rows(store.history(db=db), {1001: ("Hotel Ιόνιο", "30.00.0001")},
+                       h.item_lookup(ITEMS), {103: "Ελένη"}),
+        h.purchase_history_rows(store.purchase_history(db=db),
+                                store.list_purchase_suggestions(db=db)))
+    # one time order, newest first, both kinds mixed
+    times = [r["Ημερομηνία"] for r in rows]
+    assert times == sorted(times, reverse=True) and len(rows) == 2 + 5
+    wh_rows = h.filter_history(rows, h.KIND_WAREHOUSE)
+    assert [r["Κίνηση"] for r in wh_rows] == ["Μήνυμα στον προμηθευτή", "Απόρριψη", "Έγκριση",
+                                              "Δημιουργία", "Δημιουργία"]
+    assert {r["Τύπος"] for r in wh_rows} == {"Αποθήκη"}
+    assert {r["Πελάτης"] for r in wh_rows} == {"Προμηθευτής Χαρτικών Α.Ε."}
+    assert wh_rows[1]["Λεπτομέρειες"] == "Μεμβράνη: 40 κιβ. · Λόγος: Έχουμε απόθεμα"
+    assert wh_rows[1]["Χρήστης"] == "Διαχειριστής (Telegram)"
+    assert wh_rows[-1]["Λεπτομέρειες"] == "Χαρτί υγείας: 91 κιβ. · παραγγελία έως 6/11 · Αργήσαμε"
+    customers = h.filter_history(rows, h.KIND_CUSTOMERS)
+    assert [r["Κίνηση"] for r in customers] == ["Διόρθωση", "Δημιουργία"]
+    assert len(h.filter_history(rows, h.KIND_ALL)) == 7
+    assert len(h.filter_history(rows, key="s:SUP07", actions=["Έγκριση"])) == 1
+    assert len(h.filter_history(rows, key="c:1001")) == 2
+    assert all(not k.startswith("_") for k in h.visible(rows[0]))
+    for r in rows:
+        assert "{" not in r["Λεπτομέρειες"] and "_" not in r["Λεπτομέρειες"]

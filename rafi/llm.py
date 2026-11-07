@@ -4,6 +4,10 @@ The LLM never decides or calculates. The code gives it ready numbers and a templ
 text, and it only rewrites them in natural Greek. Every number or date in what it
 writes must appear in its input; otherwise we keep the template.
 
+Texts to a customer (SALES_NOTE) or a supplier: the AI writes only 1-2 sentences of
+greeting and introduction. The code adds below them the exact items, quantities and
+delivery date (note_block), so the list never comes from the AI.
+
 Settings (environment or .env in the repository root):
   LLM_MODE=local|cloud|mock   (default local)
   OLLAMA_URL, OLLAMA_MODEL, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, LLM_TIMEOUT
@@ -31,6 +35,15 @@ AI, TEMPLATE = "AI", "ΠΡΟΤΥΠΟ"
 MOCK_TAG = "[MOCK]"
 NO_ANSWER = "Δεν μπορώ να απαντήσω με σιγουριά· δες τα στοιχεία της πρότασης."
 HELLO = "Καλημέρα σας, από τη DEMO ΔΙΑΝΟΜΕΣ."
+ITEMS_HEADER = "Είδη:"  # first line of the code's list under an AI note
+WEEKDAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
+SUPPLIER_ASK = "Μπορείτε να μας επιβεβαιώσετε διαθεσιμότητα και ημερομηνία παράδοσης;"
+MAX_INTRO_SENTENCES = 2
+MOCK_INTRO = {
+    "customer": "Καλημέρα σας από τη DEMO ΔΙΑΝΟΜΕΣ! Σας στέλνουμε την πρόταση για την "
+                "επόμενη παράδοση· πείτε μας αν θέλετε κάποια αλλαγή.",
+    "supplier": "Καλημέρα από τη DEMO ΔΙΑΝΟΜΕΣ! Θα θέλαμε να κάνουμε την παρακάτω παραγγελία.",
+}
 
 DEFAULTS = {
     "LLM_MODE": "local",
@@ -370,15 +383,79 @@ def template_for(suggestion, kind="customer"):
     return {"reason": reason, "note": note, "source": TEMPLATE}
 
 
+_INTRO_COMMON = ("ΜΟΝΟ 1–2 σύντομες προτάσεις χαιρετισμού και εισαγωγής, σε φιλικό "
+                 "επαγγελματικό ύφος και πληθυντικό ευγενείας. Όχι «Αγαπητέ κύριε/κυρία». "
+                 "ΜΗΝ γράφεις είδη, ποσότητες, τιμές ή ημερομηνίες: ο κώδικας προσθέτει "
+                 "από κάτω την ακριβή λίστα ειδών και την ημερομηνία παράδοσης.")
 _NOTE_RULES = {
-    "customer": ("note: σύντομο, ευγενικό κείμενο email/τηλεφωνήματος που θα πει ο πωλητής "
-                 "στον πελάτη (2–4 προτάσεις), σε πληθυντικό ευγενείας. Καμία υπόσχεση "
-                 "(όχι εγγυήσεις, όχι «σίγουρα», όχι εκπτώσεις ή τιμές που δεν δίνονται)· "
-                 "προτείνεις και ρωτάς."),
-    "supplier": ("note: σύντομο, επαγγελματικό μήνυμα της αποθήκης προς τον προμηθευτή "
-                 "(2–4 προτάσεις) για την πρόταση αγοράς: τι είδη και ποσότητες, πότε τα "
-                 "χρειαζόμαστε, και αίτημα επιβεβαίωσης διαθεσιμότητας."),
+    "customer": (f"intro: η αρχή του μηνύματος του πωλητή προς τον πελάτη. {_INTRO_COMMON} "
+                 "Καμία υπόσχεση (όχι εγγυήσεις, όχι «σίγουρα», όχι εκπτώσεις)· προτείνεις "
+                 "και ρωτάς."),
+    "supplier": (f"intro: η αρχή του μηνύματος της αποθήκης προς τον προμηθευτή. "
+                 f"{_INTRO_COMMON}"),
 }
+
+
+def _date_words(value):
+    """'2026-11-04' -> 'Τετάρτη 4/11/2026' (the text as given if it is not a date)."""
+    try:
+        d = datetime.fromisoformat(str(value)[:10])
+    except ValueError:
+        return str(value)
+    return f"{WEEKDAYS[d.weekday()]} {d.day}/{d.month}/{d.year}"
+
+
+def _qty_text(q):
+    try:
+        q = float(q)
+    except (TypeError, ValueError):
+        return str(q)
+    return f"{q:,.0f}".replace(",", ".") if q == int(q) else f"{q:.2f}".replace(".", ",")
+
+
+def _block_lines(payload, facts):
+    """[(name, qty, unit)] from the facts (they carry units) or the payload LINES."""
+    if facts and facts.get("lines"):
+        return [(l.get("name"), l.get("qty"), l.get("unit") or "") for l in facts["lines"]]
+    return [(l.get("ITEM_NAME") or l.get("name") or l.get("ITEM_CODE") or f"είδος {l.get('MTRL')}",
+             l.get("QTY1", l.get("qty")), l.get("UNIT") or l.get("unit") or "")
+            for l in (payload or {}).get("LINES") or []]
+
+
+def note_block(suggestion, kind="customer"):
+    """The part of a note the code writes: exact items, quantities and delivery date."""
+    payload, facts = _unpack(suggestion)
+    items = [f"• {name}: {_qty_text(qty)} {unit}".rstrip()
+             for name, qty, unit in _block_lines(payload, facts)]
+    if kind == "supplier":
+        p = payload or facts or {}
+        when = p.get("NEEDED_BY") or p.get("SUGGESTED_DELIVERY_DATE")
+        out = [ITEMS_HEADER, *items]
+        if when:
+            out.append(f"Παράδοση έως: {_date_words(when)}")
+        return "\n".join(out + [SUPPLIER_ASK])
+    when = (facts or {}).get("delivery_date") or (payload or {}).get("SUGGESTED_DELIVERY_DATE")
+    out = [f"Προτεινόμενη παράδοση: {_date_words(when)}"] if when else []
+    return "\n".join(out + [ITEMS_HEADER, *items])
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!;?…])\s+")
+
+
+def clean_intro(text):
+    """The AI's greeting, at most 2 sentences, one paragraph. Raises LLMError when it is
+    not a greeting we can use (empty, a list, or «Αγαπητέ ...»)."""
+    text = " ".join(str(text or "").split())
+    if not text:
+        raise LLMError("Κενή εισαγωγή.")
+    if re.search(r"αγαπητ", text, re.IGNORECASE) or text.lstrip().startswith(("•", "-", "*")):
+        raise LLMError("Η εισαγωγή δεν έχει το ύφος που θέλουμε.")
+    return " ".join(_SENTENCE_END.split(text)[:MAX_INTRO_SENTENCES])
+
+
+def compose_note(intro, suggestion, kind="customer"):
+    """AI greeting + the code's list of items and delivery date."""
+    return f"{intro}\n\n{note_block(suggestion, kind)}"
 
 
 def _texts_prompt(kind, data, template):
@@ -394,7 +471,7 @@ def _texts_prompt(kind, data, template):
         "- reason: 1–3 προτάσεις, «τι προτείνουμε και γιατί», για τον πωλητή.\n"
         f"- {_NOTE_RULES[kind]}\n"
         f"- {SAFETY}\n"
-        'Απαντάς ΜΟΝΟ με JSON: {"reason": "...", "note": "..."}')
+        'Απαντάς ΜΟΝΟ με JSON: {"reason": "...", "intro": "..."}')
     user = (f"Πρότυπο κείμενο από τον κώδικα (σωστά νούμερα, ξαναγράψε το πιο φυσικά):\n"
             f"reason: {template['reason']}\nnote: {template['note']}\n\n"
             f"Στοιχεία της πρότασης:\n{data_block(data)}")
@@ -404,6 +481,8 @@ def _texts_prompt(kind, data, template):
 def write_texts(suggestion: dict, kind: str = "customer") -> dict:
     """REASON-like text and a note (SALES_NOTE for customers, message for suppliers).
 
+    The AI writes the reason and only the greeting of the note ("intro", 1-2 sentences);
+    the note is that greeting + note_block (exact items, quantities, date) from the code.
     Returns {"reason", "note", "source"}: source "AI" when the model's text passed the
     number check, otherwise the template with source "ΠΡΟΤΥΠΟ".
     """
@@ -423,22 +502,22 @@ def write_texts(suggestion: dict, kind: str = "customer") -> dict:
     try:
         if cfg["LLM_MODE"] == "mock":
             out = {"reason": f"{MOCK_TAG} {template['reason']}",
-                   "note": f"{MOCK_TAG} {template['note']}"}
+                   "intro": f"{MOCK_TAG} {MOCK_INTRO[kind]}"}
         else:
             system, user = _texts_prompt(kind, data, template)
             out = parse_json(chat(system, user, want_json=True, cfg=cfg))
         reason = str(out.get("reason") or "").strip()
-        note = str(out.get("note") or "").strip()
-        if not reason or not note:
-            raise LLMError("Λείπει reason ή note.")
+        if not reason:
+            raise LLMError("Λείπει reason.")
+        intro = clean_intro(out.get("intro") or out.get("note"))
         allowed = allowed_facts(_clean(data), template["reason"], template["note"])
-        bad = unsupported(reason + "\n" + note, allowed)
+        bad = unsupported(reason + "\n" + intro, allowed)
         if bad:
             raise LLMError(f"Αριθμοί/ημερομηνίες που δεν υπάρχουν στην είσοδο: {bad}")
     except LLMError as e:
         log.warning("write_texts: κρατάμε το πρότυπο (%s)", e)
         return template
-    return {"reason": reason, "note": note, "source": AI}
+    return {"reason": reason, "note": compose_note(intro, suggestion, kind), "source": AI}
 
 
 def text_writer(facts):
@@ -541,7 +620,7 @@ def _demo():
     rows = _load_suggestions(3)
     if rows is None:
         print(f"Δεν βρέθηκε {_db_path()}· χρησιμοποιώ το data/sample_suggested_order.json.")
-        sample = json.loads((ROOT / "data" / "sample_suggested_order.json").read_text("utf-8"))
+        sample = json.loads((ROOT / "data" / "sample_suggested_order.json").read_text(encoding="utf-8"))
         sample.setdefault("SALES_NOTE", f"{HELLO} Σας προτείνουμε παράδοση "
                                         f"{_dm(sample['SUGGESTED_DELIVERY_DATE'])}.")
         rows = [{"id": "δείγμα", "payload": sample}]
