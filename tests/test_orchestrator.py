@@ -129,9 +129,12 @@ def purchase(mtrl, supplier="S1", order_by="2026-11-02", arrival="2026-11-09", q
             "REASON": f"Το «{name or f'Είδος {mtrl}'}» τελειώνει περίπου 7/11."}
 
 
-def affected(trdr, sid, qty=3.0, date="2026-11-03", mtrl=5001):
-    return {"TRDR": trdr, "MTRL": mtrl, "DELIVERY_DATE": date, "QTY": qty,
-            "SUGGESTION_ID": sid, "SHORT": None}
+def affected(trdr, sid, qty=3.0, date="2026-11-03", mtrl=5001, missing=None):
+    a = {"TRDR": trdr, "MTRL": mtrl, "DELIVERY_DATE": date, "QTY": qty,
+         "SUGGESTION_ID": sid, "SHORT": None}
+    if missing is not None:  # as the warehouse agent writes it (cover_deliveries)
+        a["MISSING"] = missing
+    return a
 
 
 # --- add_flag ----------------------------------------------------------------
@@ -176,9 +179,11 @@ def pdb(tmp_path):
     db = tmp_path / "p.db"
     store.save_new([sugg(1, LOSS, value=10.0), sugg(2, value=500.0), sugg(3, value=50.0)], db=db)
     store.save_purchase_new([
-        purchase(5001, "S1", flag=wh.TOO_LATE, stock=5,
-                 affected=[affected(1003, 3), affected(1002, 2), affected(1001, 1),
-                           affected(1099, None, qty=2, date="2026-11-04")]),
+        # stock 5 for 11 units: the loss risk (1) is covered, three deliveries are not
+        purchase(5001, "S1", flag=wh.SHORT, stock=5,
+                 affected=[affected(1003, 3, missing=3.0), affected(1002, 2, missing=1.0),
+                           affected(1001, 1, missing=0.0),
+                           affected(1099, None, qty=2, date="2026-11-04", missing=2.0)]),
         purchase(5002, "S1"),
         purchase(5003, "S2", order_by="2026-11-05", arrival="2026-11-10"),
         purchase(5004, "S2", order_by="2026-11-20", arrival="2026-11-25"),   # after 7 days
@@ -193,26 +198,56 @@ def test_open_purchase_orders_are_grouped(pdb):
     assert [(o["supplier_id"], o["order_by"]) for o in orders] == [("S1", "2026-11-02"),
                                                                    ("S2", "2026-11-05")]
     s1 = orders[0]
-    assert set(s1) >= {"supplier_id", "supplier_name", "order_by", "arrival", "short",
-                       "total_value_eur", "reason", "note", "lines", "affected_deliveries"}
-    assert s1["short"] and not orders[1]["short"]
+    assert set(s1) >= {"supplier_id", "supplier_name", "order_by", "arrival", "status", "short",
+                       "late", "total_value_eur", "reason", "note", "lines",
+                       "affected_deliveries", "deliveries_before_arrival"}
+    assert s1["status"] == wh.SHORT and s1["short"] and not s1["late"]
+    assert orders[1]["status"] == "" and not orders[1]["short"]
     assert s1["supplier_name"] == "Προμηθευτής S1" and s1["arrival"] == "2026-11-09"
     assert s1["total_value_eur"] == 50.0
     assert [l["mtrl"] for l in s1["lines"]] == [5001, 5002]
     assert set(s1["lines"][0]) == {"purchase_id", "mtrl", "item_name", "qty", "unit",
                                    "value_eur", "flags"}
-    assert s1["lines"][0]["flags"] == [wh.TOO_LATE] and s1["lines"][1]["flags"] == []
+    assert s1["lines"][0]["flags"] == [wh.SHORT] and s1["lines"][1]["flags"] == []
+    # only the deliveries that are not covered; all 4 are before the arrival
     a = s1["affected_deliveries"]
-    assert len(a) == 4 and {"trdr", "customer_name", "date", "qty", "suggestion_id"} <= set(a[0])
-    assert a[0]["customer_name"]  # TRDR 1003 is in TRDR.csv
+    assert [x["trdr"] for x in a] == [1003, 1002, 1099] and s1["deliveries_before_arrival"] == 4
+    assert {"trdr", "customer_name", "date", "qty", "missing", "suggestion_id"} <= set(a[0])
+    assert a[0]["customer_name"] and a[1]["missing"] == 1.0  # TRDR 1003 is in TRDR.csv
     # one reason for the whole order, in full sentences
     assert "2 είδη" in s1["reason"] and "«Είδος 5001»" in s1["reason"]
-    assert "επηρεάζονται 4 παραδόσεις" in s1["reason"]
+    assert "Δεν φτάνει το απόθεμα για το «Είδος 5001»: επηρεάζονται 3 παραδόσεις" in s1["reason"]
     assert s1["note"].startswith(llm.HELLO) and "10 κιβ. «Είδος 5001»" in s1["note"]
     assert s1["note_source"] == llm.TEMPLATE
     # a one-line order keeps the line's own reason
     assert orders[1]["reason"] == "Το «Είδος 5003» τελειώνει περίπου 7/11."
     assert len(wh.open_purchase_orders(30, db=pdb)) == 3
+
+
+def test_open_purchase_orders_late_is_not_a_shortage(tmp_path):
+    db = tmp_path / "t.db"
+    covered = [affected(1000 + i, None, qty=2.0, missing=0.0) for i in range(11)]
+    store.save_purchase_new([purchase(5075, "S7", flag=wh.LATE, stock=44, affected=covered,
+                                      name="Λαμπρυντικό πλυντηρίου 5L"),
+                             purchase(5076, "S7", name="Μαλακτικό 4L")], db=db)
+    o = orch.morning_summary(db=db)["warehouse"]
+    assert o["short_count"] == 0 and o["late_count"] == 1
+    g = o["orders"][0]
+    assert g["status"] == wh.LATE and g["late"] and not g["short"]
+    assert g["affected_deliveries"] == [] and g["deliveries_before_arrival"] == 11
+    assert g["lines"][0]["flags"] == [wh.LATE]
+    assert "Αργήσαμε για το «Λαμπρυντικό πλυντηρίου 5L»" in g["reason"]
+    assert "επηρεάζ" not in g["reason"]
+    assert orch.coordinate_shortages(db=db) == []
+
+
+def test_old_store_rows_read_as_shortage(tmp_path):
+    db = tmp_path / "t.db"
+    store.save_purchase_new([purchase(5001, flag=wh.OLD_TOO_LATE, stock=0,
+                                      affected=[affected(1001, None), affected(1002, None)])],
+                            db=db)
+    g = wh.open_purchase_orders(7, db=db)[0]
+    assert g["status"] == wh.SHORT and len(g["affected_deliveries"]) == 2
 
 
 def test_approve_and_reject_a_whole_order(pdb, tmp_path):
@@ -280,8 +315,8 @@ def test_shortage_goes_to_priorities_first(pdb):
 def test_no_shortage_when_the_stock_is_enough(tmp_path):
     db = tmp_path / "t.db"
     store.save_new([sugg(1)], db=db)
-    store.save_purchase_new([purchase(5001, flag=wh.TOO_LATE, stock=50,
-                                      affected=[affected(1001, 1)])], db=db)
+    store.save_purchase_new([purchase(5001, flag=wh.LATE, stock=50,
+                                      affected=[affected(1001, 1, missing=0.0)])], db=db)
     assert orch.coordinate_shortages(db=db) == []
     assert store.get(1, db=db)["payload"]["FLAGS"] == []
 
@@ -304,7 +339,7 @@ def test_morning_summary(pdb):
                       "value_eur", "one_line"}
     assert n["one_line"] == "Λόγος 1" and n["customer_name"]
     w = m["warehouse"]
-    assert w["orders_count"] == 2 and w["short_count"] == 1
+    assert w["orders_count"] == 2 and w["short_count"] == 1 and w["late_count"] == 0
     assert w["orders"] == wh.open_purchase_orders(7, db=pdb)
     json.dumps(m, ensure_ascii=False)  # ready for Telegram / the dashboard
 

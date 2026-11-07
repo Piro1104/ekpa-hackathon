@@ -333,7 +333,7 @@ def test_too_late_when_order_by_is_before_today():
     # 100 - 10(i+1) < 70 already on 4/11: should have ordered on Sat 31/10
     orders, _ = w.simulate_item(flat(10), 100, 3, 1, today=TODAY)
     o = orders[0]
-    assert o["FLAG"] == w.TOO_LATE
+    assert o["FLAG"] == w.LATE  # plan() turns it into ΕΛΛΕΙΨΗ when customers are not covered
     assert o["IDEAL_ORDER_BY"] == T("2026-10-31")
     assert o["ORDER_BY"] == T("2026-11-02")       # first working day from today (Sunday)
     assert o["ARRIVAL"] == T("2026-11-05")
@@ -383,13 +383,80 @@ def test_plan_too_late_lists_the_customer_deliveries(tmp_path):
     orders, stock = w.plan(d, items_df(), _customers(), det, sugg, promos_df([]), _suppliers(),
                            TODAY, stock_path=tmp_path / "none.csv")
     first = orders[orders["MTRL"] == 5001].iloc[0]
-    assert first["FLAG"] == w.TOO_LATE
+    assert first["FLAG"] == w.SHORT and first["UNCOVERED"] == 1
     assert first["AFFECTED"][0]["SUGGESTION_ID"] == 42
-    assert first["AFFECTED"][0]["QTY"] == 25
+    assert first["AFFECTED"][0]["QTY"] == 25 and first["AFFECTED"][0]["MISSING"] == 25
     assert first["QTY"] >= 10
     assert "έπρεπε να είχε παραγγελθεί" in first["REASON"]
-    assert "επηρεάζονται 1 παραδόσεις" in first["REASON"]
+    assert "επηρεάζεται 1 παράδοση σε πελάτη (λείπουν 25 κιβ.)" in first["REASON"]
     assert first["VALUE_EUR"] == round(first["QTY"] * 4.2, 2)
+
+
+def test_plan_late_when_the_stock_covers_the_customers(tmp_path):
+    # Stock 30 covers the 25 of the delivery on 3/11, but we drop under the safety stock
+    # before the goods can arrive: ΑΡΓΗΣΑΜΕ, nobody is left without goods.
+    d = deliv([(dd, 1, 5001, 20) for dd in pd.date_range("2026-07-01", "2026-10-31", freq="7D")])
+    det = details_df([(1, 5001, "2026-11-03", 20, "ΚΑΝΟΝΙΚΗ")])
+    sugg = [suggestion(42, 1, "2026-11-03", [(5001, 25)])]
+    stock = tmp_path / "stock.csv"
+    stock.write_text("MTRL,QTY\n5001,30\n", encoding="utf-8")
+    orders, _ = w.plan(d, items_df(), _customers(), det, sugg, promos_df([]), _suppliers(),
+                       TODAY, stock_path=stock)
+    first = orders[orders["MTRL"] == 5001].iloc[0]
+    assert first["FLAG"] == w.LATE and first["UNCOVERED"] == 0
+    assert [(a["SUGGESTION_ID"], a["MISSING"]) for a in first["AFFECTED"]] == [(42, 0.0)]
+    assert "έπρεπε να είχε παραγγελθεί" in first["REASON"]
+    assert "Η 1 παράδοση σε πελάτη μέχρι την άφιξη καλύπτεται από το απόθεμα" in first["REASON"]
+    assert "επηρεάζ" not in first["REASON"]
+
+
+def test_cover_deliveries_by_rank():
+    deliveries = [{"TRDR": t, "MTRL": 5075, "DELIVERY_DATE": f"2026-11-0{i + 2}", "QTY": q,
+                   "SUGGESTION_ID": sid}
+                  for i, (t, q, sid) in enumerate([(1, 3, None), (2, 4, 7), (3, 5, 8)])]
+    assert [a["MISSING"] for a in w.cover_deliveries(44, deliveries)] == [0, 0, 0]
+    # stock 6 in date order: 3 + 3, the third misses all 5
+    assert [a["MISSING"] for a in w.cover_deliveries(6, deliveries)] == [0, 1.0, 5.0]
+    # the suggestion that needs you (8, urgent) goes first, the forecast delivery last
+    rank = w.delivery_rank([{"id": 7, "action_type": "ΠΑΡΑΓΓΕΛΙΑ", "value_eur": 10.0},
+                            {"id": 8, "action_type": "ΠΑΡΑΓΓΕΛΙΑ", "value_eur": 1.0,
+                             "payload": {"FLAGS": ["ΕΠΕΙΓΟΝ"]}}])
+    assert [a["MISSING"] for a in w.cover_deliveries(6, deliveries, rank)] == [3.0, 3.0, 0]
+    assert [a["MISSING"] for a in w.cover_deliveries(11.7, deliveries)] == [0, 0, 0]  # 0.3 < 0.5
+
+
+def _late(**kw):
+    o = {"ITEM_NAME": "Λαμπρυντικό πλυντηρίου 5L", "UNIT": "τεμ.", "STOCKOUT_DATE": T("2026-11-06"),
+         "BREACH_DATE": T("2026-11-03"), "SAFETY_STOCK": 22, "LEAD_TIME_DAYS": 5, "QTY": 36,
+         "NEEDED_QTY": 36, "MIN_ORDER_QTY": 10, "ORDER_BY": T("2026-11-02"),
+         "ARRIVAL": T("2026-11-09"), "IDEAL_ORDER_BY": T("2026-10-31"), "FLAG": w.LATE,
+         "AFFECTED": [{"TRDR": i, "QTY": 2.0, "MISSING": 0.0} for i in range(11)]}
+    o.update(kw)
+    return o
+
+
+def test_reason_late_customers_covered():
+    assert w.reason_text(_late()) == (
+        "Το «Λαμπρυντικό πλυντηρίου 5L» πέφτει κάτω από το απόθεμα ασφαλείας (22 τεμ.) "
+        "περίπου 3/11 με τη ζήτηση που προβλέπουμε. Ο προμηθευτής θέλει 5 εργάσιμες· έπρεπε "
+        "να είχε παραγγελθεί έως 31/10. Οι 11 παραδόσεις σε πελάτες μέχρι την άφιξη "
+        "καλύπτονται από το απόθεμα, αλλά θα πέσουμε κάτω από το απόθεμα ασφαλείας. "
+        "Παράγγειλε 36 τεμ. το συντομότερο (έως 2/11), φτάνουν 9/11.")
+
+
+def test_reason_short_counts_only_uncovered_deliveries():
+    affected = [{"TRDR": i, "QTY": 2.0, "MISSING": 0.0} for i in range(8)] + \
+               [{"TRDR": 9, "QTY": 2.0, "MISSING": 1.5}, {"TRDR": 10, "QTY": 2.0, "MISSING": 2.0},
+                {"TRDR": 11, "QTY": 3.0, "MISSING": 3.0}]
+    text = w.reason_text(_late(FLAG=w.SHORT, AFFECTED=affected))
+    assert text.startswith("Το «Λαμπρυντικό πλυντηρίου 5L» τελειώνει περίπου 6/11")
+    assert ("Το απόθεμα δεν φτάνει για όλες τις παραδόσεις μέχρι την άφιξη: επηρεάζονται 3 "
+            "παραδόσεις σε πελάτες (λείπουν 7 τεμ.).") in text
+    assert "καλύπτονται" not in text
+    # an older store row (ΔΕΝ_ΦΤΑΝΕΙ, no MISSING) reads as ΕΛΛΕΙΨΗ with all its deliveries
+    old = [{"TRDR": 1, "QTY": 2.0}, {"TRDR": 2, "QTY": 1.0}]
+    assert w.flag_state(w.OLD_TOO_LATE) == w.SHORT and len(w.uncovered(old, w.OLD_TOO_LATE)) == 2
+    assert w.uncovered(affected, w.LATE) == []
 
 
 def test_reason_template_has_the_numbers():
