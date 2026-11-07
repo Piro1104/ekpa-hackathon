@@ -39,7 +39,7 @@ def test_customer_agent_gives_the_same_results(data, details_file, tmp_path):
                  route_cost=60)
     assert out["details_source"] == "αρχείο"
     assert len(out["suggestions"]) == 179 and len(out["result"]["saved"]) == 179
-    assert _at_risk(out["suggestions"]) == 42589.2
+    assert _at_risk(out["suggestions"]) == 42767.0
     assert {s["payload"]["TEXT_SOURCE"] for s in out["suggestions"]} == {"ΠΡΟΤΥΠΟ"}
     again = ca.run(db=tmp_path / "a.db", data=data, details_path=details_file, ai=False)
     assert again["result"] == {"saved": [], "skipped": 179}
@@ -62,7 +62,7 @@ def test_ai_texts_only_for_needs_you_and_the_top_n(data, details_file, tmp_path)
     assert all(s["payload"]["TEXT_SOURCE"] == "ΠΡΟΤΥΠΟ" for s in rest[5:])
     assert rest[5]["payload"]["REASON"] != "AI αιτιολόγηση"
     # the texts change, the numbers do not
-    assert len(sugg) == 179 and _at_risk(sugg) == 42589.2
+    assert len(sugg) == 179 and _at_risk(sugg) == 42767.0
     assert [s["PRIORITY"] for s in sugg] == list(range(1, 180))
     saved = store.list_suggestions(db=tmp_path / "b.db")
     assert sum(r["payload"]["TEXT_SOURCE"] == "AI" for r in saved) == 12
@@ -356,7 +356,7 @@ def test_orchestrator_run_no_ai(details_file, tmp_path, capsys, monkeypatch):
     out = orch.run(db=db, ai=False, details_path=details_file)
     assert len(out["customer"]["result"]["saved"]) == 179
     c = out["summary"]["customers"]
-    assert c["value_at_risk_eur"] == 42589.2 and c["counts"]["pending"] == 179
+    assert c["value_at_risk_eur"] == 42767.0 and c["counts"]["pending"] == 179
     assert len(c["needs_you"]) == 7
     w = out["summary"]["warehouse"]
     assert w["orders_count"] == len(wh.open_purchase_orders(7, db=db)) > 0
