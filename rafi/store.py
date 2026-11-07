@@ -288,6 +288,55 @@ def history(trdr=None, suggestion_id=None, db=None):
     return out
 
 
+# --- coordination (orchestrator) -------------------------------------------
+
+COORDINATE = "ΣΥΝΤΟΝΙΣΜΟΣ"
+WAREHOUSE_SHORT = "ΕΛΛΕΙΨΗ_ΑΠΟΘΗΚΗΣ"
+
+
+def active_pairs(db=None):
+    """(TRDR, MTRL) pairs that already have an active suggestion (no new one is saved for them)."""
+    conn = connect(db)
+    try:
+        rows = conn.execute("SELECT payload_json FROM suggestions WHERE status IN (?, ?, ?)",
+                            ACTIVE).fetchall()
+    finally:
+        conn.close()
+    out = set()
+    for r in rows:
+        out |= _pairs(json.loads(r["payload_json"]))
+    return out
+
+
+def add_flag(suggestion_id, flag, note, user, db=None):
+    """Add `flag` to the payload's FLAGS with a note (in FLAG_NOTES), and log ΣΥΝΤΟΝΙΣΜΟΣ.
+
+    Only while the suggestion is ΠΡΟΤΑΣΗ (a sent draft is already in the ERP). The same note
+    twice changes nothing; a new note for the same flag is added after the old one.
+    Returns True if the suggestion changed.
+    """
+    note = str(note or "").strip()
+    with _transaction(db) as conn:
+        r = _row(conn, suggestion_id)
+        if r["status"] != PROPOSED:
+            raise StoreError(f"Η πρόταση {suggestion_id} είναι {r['status']}· "
+                             f"σημείωση μπαίνει μόνο σε {PROPOSED}.")
+        payload = json.loads(r["payload_json"])
+        flags = payload.setdefault("FLAGS", [])
+        notes = payload.setdefault("FLAG_NOTES", {})
+        old = notes.get(flag, "")
+        if flag in flags and (not note or note in old):
+            return False
+        if flag not in flags:
+            flags.append(flag)
+        if note and note not in old:
+            notes[flag] = f"{old} {note}".strip()
+        conn.execute("UPDATE suggestions SET payload_json = ? WHERE id = ?",
+                     (_dumps(payload), suggestion_id))
+        _log(conn, suggestion_id, user, COORDINATE, {"flag": flag, "note": note})
+    return True
+
+
 # --- purchase suggestions (warehouse agent) ------------------------------------
 # Our own orders to suppliers. They never go to the mock ERP (it takes customers only):
 # ΠΡΟΤΑΣΗ -> ΕΓΚΡΙΘΗΚΕ (JSON written to purchase_orders/) or ΠΡΟΤΑΣΗ -> ΑΠΟΡΡΙΦΘΗΚΕ (reason).
@@ -439,6 +488,22 @@ def reject_purchase(purchase_id, reason, user, db=None):
             raise StoreError(f"Η πρόταση αγοράς {purchase_id} είναι {r['status']}· "
                              f"απόρριψη γίνεται μόνο σε {PROPOSED}.")
         _purchase_log(conn, purchase_id, user, REJECT, {"reason": str(reason).strip()})
+
+
+def set_purchase_fields(purchase_ids, fields, db=None):
+    """Merge `fields` into the payload of purchase suggestions still in ΠΡΟΤΑΣΗ (e.g. the
+    supplier note of their order). Returns how many changed."""
+    n = 0
+    with _purchase_transaction(db) as conn:
+        for pid in purchase_ids:
+            r = _purchase_row(conn, pid)
+            if r["status"] != PROPOSED:
+                continue
+            payload = {**json.loads(r["payload_json"]), **fields}
+            conn.execute("UPDATE purchase_suggestions SET payload_json = ? WHERE id = ?",
+                         (_dumps(payload), pid))
+            n += 1
+    return n
 
 
 def list_purchase_suggestions(status=None, db=None):
