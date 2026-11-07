@@ -269,3 +269,10 @@ def test_settings_round_trip(tmp_path):
         h.write_settings(-1, "draft_only", path)
     with pytest.raises(ValueError):
         h.write_settings(60, "κάτι άλλο", path)
+
+
+def test_summary_does_not_stop_inside_an_item_name():
+    s = make(reason="Το «Νερό 0,75L γυάλινο κιβ. 12τεμ» τελειώνει περίπου 3/11· άλλα.")
+    assert h.summary(s) == "Το «Νερό 0,75L γυάλινο κιβ. 12τεμ» τελειώνει περίπου 3/11"
+    s = make(reason="Ο πελάτης παρήγγελνε κάθε ~5 ημέρες. Αγορές 12 μηνών: 3.000 €.")
+    assert h.summary(s) == "Ο πελάτης παρήγγελνε κάθε ~5 ημέρες"
