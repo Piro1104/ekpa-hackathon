@@ -12,3 +12,4 @@ draft_orders/
 .claude/settings.local.json
 # Generated submissions
 submissions/
+config/settings.json

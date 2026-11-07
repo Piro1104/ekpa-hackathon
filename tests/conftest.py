@@ -38,3 +38,9 @@ def erp_url():
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_settings(tmp_path, monkeypatch):
+    """Tests never read or write the real config/settings.json."""
+    monkeypatch.setenv("RAFI_SETTINGS", str(tmp_path / "settings.json"))
