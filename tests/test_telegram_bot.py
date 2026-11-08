@@ -646,7 +646,8 @@ def test_question_context_has_summary_needs_you_and_the_week(db, monkeypatch):
     assert ctx["πελάτες"]["προς_έγκριση"] == 5 and ctx["πελάτες"]["αξία_σε_κίνδυνο_eur"] == 510.5
     needs = ctx["χρειάζονται_εσένα"]
     assert needs[0]["πελάτης"] == "Hotel Ιόνιο Μ.Ε.Π.Ε."
-    assert set(needs[0]) == {"πελάτης", "κωδικός", "τύπος", "παράδοση", "αξία_eur", "φράση"}
+    assert set(needs[0]) == {"πελάτης", "κωδικός", "TRDR", "τύπος", "παράδοση", "αξία_eur",
+                             "φράση"}
     assert needs[0]["φράση"] == "Το νερό τελειώνει περίπου 6/11"
     week = ctx["παραγγελίες_αποθήκης_εβδομάδας"]
     assert [(o["προμηθευτής"], o["κατάσταση"]) for o in week] == [
@@ -671,6 +672,16 @@ def test_assistant_down_gives_a_short_message(db, monkeypatch):
     monkeypatch.setattr(llm, "answer", lambda q, c: 1 / 0)
     say(tb.Bot(api, CFG, path), "Τι παραγγέλνουμε;")
     assert api.texts(ADMIN)[-1] == tb.ASSISTANT_DOWN
+
+
+def test_unsure_answer_is_shown_as_is(db, monkeypatch):
+    path, _ = db
+    from rafi import llm
+    monkeypatch.setattr(llm, "answer", lambda q, c: {"text": llm.NO_SURE_ANSWER,
+                                                      "source": llm.TEMPLATE})
+    api = FakeApi()
+    say(tb.Bot(api, CFG, path), "Τι παραγγέλνουμε;")
+    assert api.texts(ADMIN)[-1] == llm.NO_SURE_ANSWER
 
 
 def test_only_the_admin_text_goes_to_the_assistant(db, monkeypatch):

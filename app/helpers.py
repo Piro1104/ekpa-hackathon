@@ -471,8 +471,9 @@ def ask_assistant(question, context):
 
 def _brief(s, customers_map):
     p = s["payload"]
-    name = customers_map.get(int(s["trdr"]), ("", ""))[0]
-    return {"id": s["id"], "customer": name, "customer_code": p.get("CUSTOMER_CODE"),
+    name, code = customers_map.get(int(s["trdr"]), ("", ""))
+    return {"id": s["id"], "customer": name, "trdr": int(s["trdr"]),
+            "customer_code": p.get("CUSTOMER_CODE") or code,
             "type": label(s["action_type"]), "flags": [label(f) for f in p.get("FLAGS", [])],
             "delivery_date": s["delivery_date"], "value_eur": s["value_eur"],
             "priority": s["priority"], "reason": p.get("REASON")}
@@ -490,13 +491,14 @@ def suggestion_context(s, customers_map=None, items_map=None):
     """Context for the chat of one suggestion: all its fields and its lines."""
     customers_map, items_map = customers_map or {}, items_map or {}
     p = s["payload"]
-    name = customers_map.get(int(s["trdr"]), ("", ""))[0]
+    name, code = customers_map.get(int(s["trdr"]), ("", ""))
     lines = []
     for l in p.get("LINES", []):
         item, unit = items_map.get(int(l["MTRL"]), (l.get("ITEM_NAME"), ""))
         lines.append({**l, "ITEM_NAME": item, "UNIT": unit})
     fields = {k: v for k, v in s.items() if k != "payload"}
-    return {"today": SCENARIO_TODAY.isoformat(), "customer_name": name, **fields,
+    return {"today": SCENARIO_TODAY.isoformat(), "customer_name": name,
+            "customer_code": p.get("CUSTOMER_CODE") or code, **fields,
             "type": label(s["action_type"]), "payload": {**p, "LINES": lines}}
 
 

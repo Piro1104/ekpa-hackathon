@@ -414,7 +414,8 @@ def question_context(db=None, today=h.SCENARIO_TODAY):
         if s is None or s["status"] != h.PROPOSED:
             continue
         name, code = customer_of(s)
-        needs.append({"πελάτης": name, "κωδικός": code, "τύπος": kind_text(s),
+        needs.append({"πελάτης": name, "κωδικός": code, "TRDR": int(s["trdr"]),
+                      "τύπος": kind_text(s),
                       "παράδοση": s["delivery_date"], "αξία_eur": s["value_eur"],
                       "φράση": _one_line(s["payload"].get("REASON"))})
     n = c["counts"]
@@ -456,6 +457,8 @@ def answer_question(question, db=None):
     except Exception as e:  # never let a question break the bot
         log.warning("answer_question: %s", type(e).__name__)
         return ASSISTANT_DOWN, False
+    if out.get("text") == llm.NO_SURE_ANSWER:  # numbers failed the check twice
+        return llm.NO_SURE_ANSWER, False
     if out.get("source") != llm.AI or not str(out.get("text") or "").strip():
         return ASSISTANT_DOWN, False
     return str(out["text"]).strip(), True

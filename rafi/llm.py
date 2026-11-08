@@ -4,9 +4,9 @@ The LLM never decides or calculates. The code gives it ready numbers and a templ
 text, and it only rewrites them in natural Greek. Every number or date in what it
 writes must appear in its input; otherwise we keep the template.
 
-Texts to a customer (SALES_NOTE) or a supplier: the AI writes only 1-2 sentences of
-greeting and introduction. The code adds below them the exact items, quantities and
-delivery date (note_block), so the list never comes from the AI.
+Texts to a customer (SALES_NOTE) or a supplier: a fixed greeting (GREETING) and below it
+the exact items, quantities and delivery date (note_block), all from the code. The AI
+writes only the REASON and the chat answers.
 
 Settings (environment or .env in the repository root):
   LLM_MODE=local|cloud|mock   (default local)
@@ -34,16 +34,22 @@ log = logging.getLogger(__name__)
 AI, TEMPLATE = "AI", "ΠΡΟΤΥΠΟ"
 MOCK_TAG = "[MOCK]"
 NO_ANSWER = "Δεν μπορώ να απαντήσω με σιγουριά· δες τα στοιχεία της πρότασης."
+# chat answer whose numbers failed the check twice
+NO_SURE_ANSWER = ("Δεν βρήκα σίγουρη απάντηση. Δοκίμασε πιο συγκεκριμένη ερώτηση, "
+                  "π.χ. \"Γιατί έκτακτο δρομολόγιο;\"")
+EXACT_NUMBERS = ("Γράψε τους αριθμούς ΑΚΡΙΒΩΣ όπως στα δεδομένα, χωρίς πράξεις ή "
+                 "στρογγυλοποιήσεις, σε 2–4 σύντομες προτάσεις.")
 HELLO = "Καλημέρα σας, από τη DEMO ΔΙΑΝΟΜΕΣ."
 ITEMS_HEADER = "Είδη:"  # first line of the code's list under an AI note
 WEEKDAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
 SUPPLIER_ASK = "Μπορείτε να μας επιβεβαιώσετε διαθεσιμότητα και ημερομηνία παράδοσης;"
 MAX_INTRO_SENTENCES = 2
-MOCK_INTRO = {
+GREETING = {  # fixed greeting of customer / supplier texts (never written by the AI)
     "customer": "Καλημέρα σας από τη DEMO ΔΙΑΝΟΜΕΣ! Σας στέλνουμε την πρόταση για την "
                 "επόμενη παράδοση· πείτε μας αν θέλετε κάποια αλλαγή.",
     "supplier": "Καλημέρα από τη DEMO ΔΙΑΝΟΜΕΣ! Θα θέλαμε να κάνουμε την παρακάτω παραγγελία.",
 }
+MOCK_INTRO = GREETING  # old name
 
 DEFAULTS = {
     "LLM_MODE": "local",
@@ -222,6 +228,8 @@ SAFETY = (f"Ό,τι βρίσκεται ανάμεσα σε {DATA_START} και {
 _ISO = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 _DMY = re.compile(r"(?<![\d.,/])(\d{1,2})/(\d{1,2})(?:/(\d{4}|\d{2}))?(?![\d/])")
 _NUM = re.compile(r"\d+(?:[.,]\d+)*")
+# codes and numbers as written: 30.00.0036, 10.02.008, 1036, 2026-11-04, 4/11
+_TOKEN = re.compile(r"\d+(?:[.,/\-]\d+)*")
 
 
 def _dates(text):
@@ -285,17 +293,24 @@ def _strings(obj):
 
 
 def allowed_facts(*sources):
-    """Numbers and dates that appear anywhere in the input (data dicts or texts)."""
-    numbers, dates = set(), set()
+    """Numbers, dates and the raw text of everything in the input (data dicts or texts)."""
+    numbers, dates, texts = set(), set(), []
     for src in sources:
         for s in _strings(src):
+            texts.append(s)
             found, rest = _dates(s)
             for d, mo, y in found:
                 dates.add((d, mo, y))
                 numbers.update({float(d), float(mo)} | ({float(y)} if y else set()))
             for tok in _NUM.findall(rest):
                 numbers.update(_number_values(tok))
-    return numbers, dates
+    return numbers, dates, "\n".join(texts)
+
+
+def _verbatim(token, pool):
+    """True when `token` appears as written in `pool`, not as part of a longer number."""
+    pattern = rf"(?<![\d.,/\-]){re.escape(token)}(?![\d]|[.,/\-]\d)"
+    return re.search(pattern, pool) is not None
 
 
 def _number_ok(token, allowed):
@@ -309,10 +324,15 @@ def _number_ok(token, allowed):
 
 def unsupported(text, allowed):
     """Numbers / dates in `text` that are not in the input. Empty list = text is fine."""
-    numbers, dates = allowed
+    numbers, dates = allowed[0], allowed[1]
+    pool = allowed[2] if len(allowed) > 2 else ""
+    # anything written exactly as somewhere in the input (customer codes, TRDR, MTRL,
+    # item codes, dates) is fine as it is
+    text = _TOKEN.sub(lambda m: " " if pool and _verbatim(m.group(), pool) else m.group(),
+                      text or "")
     dm = {(d, mo) for d, mo, _ in dates}
     bad = []
-    found, rest = _dates(text or "")
+    found, rest = _dates(text)
     for d, mo, y in found:
         if y is None:
             ok = (d, mo) in dm
@@ -383,16 +403,10 @@ def template_for(suggestion, kind="customer"):
     return {"reason": reason, "note": note, "source": TEMPLATE}
 
 
-_INTRO_COMMON = ("ΜΟΝΟ 1–2 σύντομες προτάσεις χαιρετισμού και εισαγωγής, σε φιλικό "
-                 "επαγγελματικό ύφος και πληθυντικό ευγενείας. Όχι «Αγαπητέ κύριε/κυρία». "
-                 "ΜΗΝ γράφεις είδη, ποσότητες, τιμές ή ημερομηνίες: ο κώδικας προσθέτει "
-                 "από κάτω την ακριβή λίστα ειδών και την ημερομηνία παράδοσης.")
 _NOTE_RULES = {
-    "customer": (f"intro: η αρχή του μηνύματος του πωλητή προς τον πελάτη. {_INTRO_COMMON} "
-                 "Καμία υπόσχεση (όχι εγγυήσεις, όχι «σίγουρα», όχι εκπτώσεις)· προτείνεις "
-                 "και ρωτάς."),
-    "supplier": (f"intro: η αρχή του μηνύματος της αποθήκης προς τον προμηθευτή. "
-                 f"{_INTRO_COMMON}"),
+    "customer": ("Η πρόταση αφορά πελάτη. Καμία υπόσχεση (όχι εγγυήσεις, όχι «σίγουρα», "
+                 "όχι εκπτώσεις)."),
+    "supplier": "Η πρόταση αφορά αγορά της αποθήκης από προμηθευτή.",
 }
 
 
@@ -454,7 +468,7 @@ def clean_intro(text):
 
 
 def compose_note(intro, suggestion, kind="customer"):
-    """AI greeting + the code's list of items and delivery date."""
+    """Greeting + the code's list of items and delivery date."""
     return f"{intro}\n\n{note_block(suggestion, kind)}"
 
 
@@ -471,7 +485,7 @@ def _texts_prompt(kind, data, template):
         "- reason: 1–3 προτάσεις, «τι προτείνουμε και γιατί», για τον πωλητή.\n"
         f"- {_NOTE_RULES[kind]}\n"
         f"- {SAFETY}\n"
-        'Απαντάς ΜΟΝΟ με JSON: {"reason": "...", "intro": "..."}')
+        'Απαντάς ΜΟΝΟ με JSON: {"reason": "..."}')
     user = (f"Πρότυπο κείμενο από τον κώδικα (σωστά νούμερα, ξαναγράψε το πιο φυσικά):\n"
             f"reason: {template['reason']}\nnote: {template['note']}\n\n"
             f"Στοιχεία της πρότασης:\n{data_block(data)}")
@@ -481,8 +495,8 @@ def _texts_prompt(kind, data, template):
 def write_texts(suggestion: dict, kind: str = "customer") -> dict:
     """REASON-like text and a note (SALES_NOTE for customers, message for suppliers).
 
-    The AI writes the reason and only the greeting of the note ("intro", 1-2 sentences);
-    the note is that greeting + note_block (exact items, quantities, date) from the code.
+    The AI writes only the reason. The note is the fixed GREETING + note_block (exact
+    items, quantities, date), both from the code.
     Returns {"reason", "note", "source"}: source "AI" when the model's text passed the
     number check, otherwise the template with source "ΠΡΟΤΥΠΟ".
     """
@@ -501,23 +515,22 @@ def write_texts(suggestion: dict, kind: str = "customer") -> dict:
     cfg = settings()
     try:
         if cfg["LLM_MODE"] == "mock":
-            out = {"reason": f"{MOCK_TAG} {template['reason']}",
-                   "intro": f"{MOCK_TAG} {MOCK_INTRO[kind]}"}
+            out = {"reason": f"{MOCK_TAG} {template['reason']}"}
         else:
             system, user = _texts_prompt(kind, data, template)
             out = parse_json(chat(system, user, want_json=True, cfg=cfg))
         reason = str(out.get("reason") or "").strip()
         if not reason:
             raise LLMError("Λείπει reason.")
-        intro = clean_intro(out.get("intro") or out.get("note"))
         allowed = allowed_facts(_clean(data), template["reason"], template["note"])
-        bad = unsupported(reason + "\n" + intro, allowed)
+        bad = unsupported(reason, allowed)
         if bad:
             raise LLMError(f"Αριθμοί/ημερομηνίες που δεν υπάρχουν στην είσοδο: {bad}")
     except LLMError as e:
         log.warning("write_texts: κρατάμε το πρότυπο (%s)", e)
         return template
-    return {"reason": reason, "note": compose_note(intro, suggestion, kind), "source": AI}
+    return {"reason": reason, "note": compose_note(GREETING[kind], suggestion, kind),
+            "source": AI}
 
 
 def text_writer(facts):
@@ -531,43 +544,57 @@ def text_writer(facts):
 
 # --- chat ------------------------------------------------------------------
 
+_ANSWER_SYSTEM = (
+    "Είσαι ο βοηθός του Account Manager στο «Ράφι» της DEMO ΔΙΑΝΟΜΕΣ Α.Ε. "
+    "Απαντάς στα ελληνικά, σύντομα και πρακτικά.\n"
+    "Κανόνες:\n"
+    "- Απαντάς ΜΟΝΟ από τα δεδομένα που σου δίνονται. Αν κάτι δεν υπάρχει εκεί, "
+    "λες καθαρά ότι δεν το έχεις.\n"
+    "- Κανένας υπολογισμός, κανένας νέος αριθμός ή ημερομηνία: κάθε αριθμός ή "
+    "ημερομηνία που γράφεις υπάρχει ήδη στα δεδομένα ή στην ερώτηση.\n"
+    f"- {EXACT_NUMBERS}\n"
+    "- Δεν αποφασίζεις και δεν εκτελείς τίποτα· μπορείς να προτείνεις πορεία "
+    "(π.χ. σειρά τηλεφωνημάτων) που εγκρίνει ο χρήστης.\n"
+    "- Αν η ερώτηση είναι ασαφής, κάνε ΜΙΑ σύντομη διευκρινιστική ερώτηση.\n"
+    f"- {SAFETY}\n"
+    'Απαντάς ΜΟΝΟ με JSON: {"text": "..."}')
+_ANSWER_RETRY = ("ΠΡΟΣΟΧΗ: η προηγούμενη απάντησή σου είχε αριθμούς που δεν υπάρχουν στα "
+                 f"δεδομένα. {EXACT_NUMBERS}")
+
+
 def answer(question: str, context: dict) -> dict:
-    """Answer the Account Manager only from `context`. Returns {"text", "source"}."""
+    """Answer the Account Manager only from `context`. Returns {"text", "source"}.
+
+    If the numbers of the answer are not in the context, one more try with a stricter
+    instruction; if that fails too, NO_SURE_ANSWER (source ΠΡΟΤΥΠΟ).
+    """
     question = str(question or "").strip()
     fallback = {"text": NO_ANSWER, "source": TEMPLATE}
     if not question:
         return fallback
     cfg = settings()
-    try:
-        if cfg["LLM_MODE"] == "mock":
-            text = (f"{MOCK_TAG} Δοκιμαστική απάντηση χωρίς πραγματικό μοντέλο στην ερώτηση: "
-                    f"«{question}».")
-        else:
-            system = (
-                "Είσαι ο βοηθός του Account Manager στο «Ράφι» της DEMO ΔΙΑΝΟΜΕΣ Α.Ε. "
-                "Απαντάς στα ελληνικά, σύντομα και πρακτικά.\n"
-                "Κανόνες:\n"
-                "- Απαντάς ΜΟΝΟ από τα δεδομένα που σου δίνονται. Αν κάτι δεν υπάρχει εκεί, "
-                "λες καθαρά ότι δεν το έχεις.\n"
-                "- Κανένας υπολογισμός, κανένας νέος αριθμός ή ημερομηνία: κάθε αριθμός ή "
-                "ημερομηνία που γράφεις υπάρχει ήδη στα δεδομένα ή στην ερώτηση.\n"
-                "- Δεν αποφασίζεις και δεν εκτελείς τίποτα· μπορείς να προτείνεις πορεία "
-                "(π.χ. σειρά τηλεφωνημάτων) που εγκρίνει ο χρήστης.\n"
-                "- Αν η ερώτηση είναι ασαφής, κάνε ΜΙΑ σύντομη διευκρινιστική ερώτηση.\n"
-                f"- {SAFETY}\n"
-                'Απαντάς ΜΟΝΟ με JSON: {"text": "..."}')
-            user = f"Ερώτηση: {question}\n\nΔεδομένα:\n{data_block(context or {})}"
-            text = str(parse_json(chat(system, user, want_json=True, cfg=cfg)).get("text")
-                       or "").strip()
-        if not text:
-            raise LLMError("Κενή απάντηση.")
-        bad = unsupported(text, allowed_facts(_clean(context or {}), question))
-        if bad:
-            raise LLMError(f"Αριθμοί/ημερομηνίες που δεν υπάρχουν στο context: {bad}")
-    except LLMError as e:
-        log.warning("answer: χωρίς απάντηση AI (%s)", e)
-        return fallback
-    return {"text": text, "source": AI}
+    allowed = allowed_facts(_clean(context or {}), question)
+    user = f"Ερώτηση: {question}\n\nΔεδομένα:\n{data_block(context or {})}"
+    for attempt in range(2):
+        try:
+            if cfg["LLM_MODE"] == "mock":
+                text = (f"{MOCK_TAG} Δοκιμαστική απάντηση χωρίς πραγματικό μοντέλο στην "
+                        f"ερώτηση: «{question}».")
+            else:
+                system = _ANSWER_SYSTEM + ("\n" + _ANSWER_RETRY if attempt else "")
+                text = str(parse_json(chat(system, user, want_json=True, cfg=cfg)).get("text")
+                           or "").strip()
+            if not text:
+                raise LLMError("Κενή απάντηση.")
+        except LLMError as e:
+            log.warning("answer: χωρίς απάντηση AI (%s)", e)
+            return fallback
+        bad = unsupported(text, allowed)
+        if not bad:
+            return {"text": text, "source": AI}
+        log.warning("answer: προσπάθεια %d, αριθμοί/ημερομηνίες που δεν υπάρχουν στο "
+                    "context: %s", attempt + 1, bad)
+    return {"text": NO_SURE_ANSWER, "source": TEMPLATE}
 
 
 # --- CLI -------------------------------------------------------------------

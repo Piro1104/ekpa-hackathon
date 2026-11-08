@@ -272,7 +272,7 @@ def test_supplier_notes_ai_and_fallback(pdb, monkeypatch):
     monkeypatch.setenv("LLM_MODE", "mock")
     assert wh.write_group_notes(7, db=pdb) == {"orders": 2, "ai": 2}
     orders = wh.open_purchase_orders(7, db=pdb)
-    assert all(o["note_source"] == llm.AI and o["note"].startswith(llm.MOCK_TAG) for o in orders)
+    assert all(o["note_source"] == llm.AI and o["note"].startswith(llm.GREETING["supplier"]) for o in orders)
     assert wh.open_purchase_orders(30, db=pdb)[2]["note_source"] == llm.TEMPLATE  # not written
     # a new line in the same order: the old note no longer covers it, back to the template
     store.save_purchase_new([purchase(5006, "S1")], db=pdb)
