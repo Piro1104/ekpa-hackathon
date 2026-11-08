@@ -121,7 +121,8 @@ def test_numbers_in_names_and_template_are_allowed():
 def test_mock_mode_is_marked_and_uses_template_numbers(mode):
     out = llm.write_texts(STORE_ROW)
     assert out["source"] == "AI"
-    assert out["reason"].startswith("[MOCK]") and out["note"].startswith("[MOCK]")
+    assert out["reason"].startswith("[MOCK]")
+    assert out["note"].startswith(llm.GREETING["customer"])  # greeting is not from the AI
     assert STORE_ROW["payload"]["REASON"] in out["reason"]
 
 
@@ -168,7 +169,7 @@ def test_http_error_falls_back_to_template(monkeypatch, mode):
 
 
 @pytest.mark.parametrize("content", ["δεν είναι json", '{"reason": "μισό', "[1, 2]",
-                                     '{"reason": "Μόνο αιτιολόγηση"}', '{"reason": "", "note": ""}'])
+                                     '{"reason": ""}', '{"reason": "", "note": ""}'])
 def test_unreadable_or_incomplete_json_falls_back(ollama, content):
     ollama["reply"] = content
     assert llm.write_texts(STORE_ROW)["source"] == "ΠΡΟΤΥΠΟ"
@@ -204,7 +205,7 @@ def test_text_writer_adapter(ollama):
     ollama["reply"] = reply("Προτείνουμε 4 κιβ. για 4/11.", "Καλημέρα σας!")
     assert llm.text_writer(ORDER_FACTS) == {
         "REASON": "Προτείνουμε 4 κιβ. για 4/11.",
-        "SALES_NOTE": "Καλημέρα σας!\n\nΠροτεινόμενη παράδοση: Τετάρτη 4/11/2026\n"
+        "SALES_NOTE": f"{llm.GREETING['customer']}\n\nΠροτεινόμενη παράδοση: Τετάρτη 4/11/2026\n"
                       "Είδη:\n• Νερό 0,5L: 4 κιβ."}
     ollama["reply"] = requests.Timeout("slow")
     assert llm.text_writer(ORDER_FACTS) == {}  # suggestions.py keeps its template
@@ -286,8 +287,7 @@ def test_answer_may_reuse_numbers_from_question(ollama):
     assert llm.answer("Να στείλω 15 κιβώτια;", CONTEXT)["source"] == "AI"
 
 
-@pytest.mark.parametrize("content", ['{"text": "Ο 1004 θα αγοράσει 99 κιβώτια."}',
-                                     "όχι json", '{"text": ""}'])
+@pytest.mark.parametrize("content", ["όχι json", '{"text": ""}'])
 def test_answer_falls_back(ollama, content):
     ollama["reply"] = content
     assert llm.answer("Τι κάνει ο 1004;", CONTEXT) == {"text": llm.NO_ANSWER, "source": "ΠΡΟΤΥΠΟ"}
@@ -321,58 +321,112 @@ def test_cli_demo_reads_store(monkeypatch, mode, tmp_path, capsys):
     assert summary["σύνολο_προτάσεων"] == 1 and summary["προτάσεις"][0]["πελάτης"] == 1004
 
 
-# --- AI writes only the greeting; the code writes the list ----------------------
+# --- fixed greeting from the code; the AI writes only the REASON -----------------
+
+CUSTOMER_GREETING = ("Καλημέρα σας από τη DEMO ΔΙΑΝΟΜΕΣ! Σας στέλνουμε την πρόταση για την "
+                     "επόμενη παράδοση· πείτε μας αν θέλετε κάποια αλλαγή.")
+SUPPLIER_GREETING = "Καλημέρα από τη DEMO ΔΙΑΝΟΜΕΣ! Θα θέλαμε να κάνουμε την παρακάτω παραγγελία."
+
 
 def intro_reply(reason, intro):
     return json.dumps({"reason": reason, "intro": intro}, ensure_ascii=False)
 
 
-def test_mock_sales_note_is_greeting_plus_code_list(mode):
+def test_mock_sales_note_is_fixed_greeting_plus_code_list(mode):
     out = llm.write_texts(ORDER_FACTS)
     assert out["source"] == "AI"
-    assert out["note"] == (f"{llm.MOCK_TAG} {llm.MOCK_INTRO['customer']}\n\n"
+    assert out["note"] == (f"{CUSTOMER_GREETING}\n\n"
                            "Προτεινόμενη παράδοση: Τετάρτη 4/11/2026\nΕίδη:\n• Νερό 0,5L: 4 κιβ.")
 
 
-def test_mock_supplier_message_is_greeting_plus_code_list(mode):
+def test_mock_supplier_message_is_fixed_greeting_plus_code_list(mode):
     out = llm.write_texts(SUPPLIER, kind="supplier")
-    assert out["note"] == (f"{llm.MOCK_TAG} {llm.MOCK_INTRO['supplier']}\n\n"
+    assert out["note"] == (f"{SUPPLIER_GREETING}\n\n"
                            "Είδη:\n• Νερό 0,5L: 120 κιβ.\nΠαράδοση έως: Δευτέρα 9/11/2026\n"
                            + llm.SUPPLIER_ASK)
 
 
-def test_list_in_the_note_always_comes_from_the_code(ollama):
-    # the model tries to write its own (wrong) list: only 2 sentences are kept, and its
-    # quantity 40 is not in the input, so the template stays
-    ollama["reply"] = intro_reply("Παράδοση 4/11.", "Καλημέρα σας! Σας στέλνουμε την πρόταση. "
-                                                    "• Νερό 0,5L: 40 κιβ.")
+def test_ai_greeting_is_ignored_and_list_comes_from_the_code(ollama):
+    ollama["reply"] = intro_reply("Παράδοση 4/11.", "Αγαπητέ κύριε, • Νερό 0,5L: 40 κιβ.")
     out = llm.write_texts(ORDER_FACTS)
-    assert out["source"] == "AI"
-    assert out["note"].startswith("Καλημέρα σας! Σας στέλνουμε την πρόταση.\n\n")
-    assert "40" not in out["note"] and out["note"].endswith("• Νερό 0,5L: 4 κιβ.")
+    assert out["source"] == "AI" and out["reason"] == "Παράδοση 4/11."
+    assert out["note"].startswith(CUSTOMER_GREETING + "\n\n")
+    assert "40" not in out["note"] and "Αγαπητέ" not in out["note"]
+    assert out["note"].endswith("• Νερό 0,5L: 4 κιβ.")
     multi = {**ORDER_FACTS, "lines": ORDER_FACTS["lines"] + [
         {"name": "Κόλα 330ml", "unit": "κιβ.", "qty": 2, "depletion": "2026-11-07",
          "reason_code": "ΚΑΝΟΝΙΚΟ"}]}
-    ollama["reply"] = intro_reply("Παράδοση 4/11.", "Καλημέρα! Ετοιμάσαμε την παραγγελία σας.")
     note = llm.write_texts(multi)["note"]
     assert note.split("\n")[-2:] == ["• Νερό 0,5L: 4 κιβ.", "• Κόλα 330ml: 2 κιβ."]
 
 
-def test_intro_keeps_at_most_two_sentences(ollama):
-    ollama["reply"] = intro_reply("Αγορά 120 κιβ. έως 9/11.", "Καλημέρα σας! Ελπίζουμε όλα καλά. "
-                                                    "Τρίτη πρόταση που κόβεται.")
-    note = llm.write_texts(SUPPLIER, kind="supplier")["note"]
-    assert note.startswith("Καλημέρα σας! Ελπίζουμε όλα καλά.\n\nΕίδη:")
-    assert "Τρίτη" not in note
+def test_supplier_note_has_fixed_greeting(ollama):
+    ollama["reply"] = json.dumps({"reason": "Αγορά 120 κιβ. έως 9/11."}, ensure_ascii=False)
+    out = llm.write_texts(SUPPLIER, kind="supplier")
+    assert out["source"] == "AI" and out["note"].startswith(SUPPLIER_GREETING + "\n\nΕίδη:")
 
 
-def test_formal_dear_sir_falls_back_to_template(ollama):
-    ollama["reply"] = intro_reply("Παράδοση 4/11.", "Αγαπητέ κύριε/κυρία, σας γράφουμε.")
-    assert llm.write_texts(ORDER_FACTS)["source"] == "ΠΡΟΤΥΠΟ"
-
-
-def test_prompt_asks_only_for_a_greeting(ollama):
-    ollama["reply"] = intro_reply("Αγορά έως 9/11.", "Καλημέρα!")
+def test_prompt_asks_only_for_the_reason(ollama):
+    ollama["reply"] = json.dumps({"reason": "Αγορά έως 9/11."}, ensure_ascii=False)
     assert llm.write_texts(SUPPLIER, kind="supplier")["source"] == "AI"
     system = ollama["calls"][0]["body"]["messages"][0]["content"]
-    assert "1–2" in system and "Αγαπητέ" in system and '"intro"' in system
+    assert '"reason"' in system and '"intro"' not in system
+
+
+# --- number check: codes written as in the context ------------------------------
+
+CHAT_CONTEXT = {"today": "2026-11-01", "customer_name": "Ταβέρνα Δοκιμή", "trdr": 1036,
+                "customer_code": "30.00.0036", "value_eur": 512.4,
+                "payload": {"TRDR": 1036, "CUSTOMER_CODE": "30.00.0036",
+                            "LINES": [{"MTRL": 5016, "ITEM_CODE": "10.02.008", "QTY1": 4}]}}
+
+
+def test_codes_from_the_context_pass_the_check():
+    allowed = llm.allowed_facts(CHAT_CONTEXT)
+    assert llm.unsupported("Ο πελάτης 30.00.0036 (TRDR 1036) θέλει το 10.02.008 (MTRL 5016).",
+                           allowed) == []
+    assert llm.unsupported("Ο πελάτης 30.00.0037 χρωστά 999,50 €.", allowed) == [
+        "30.00.0037", "999,50"]
+
+
+def test_answer_with_customer_code_and_trdr_passes(ollama):
+    text = "Ο πελάτης 30.00.0036 (TRDR 1036) χρειάζεται παράδοση· αξία 512,4 €."
+    ollama["reply"] = json.dumps({"text": text}, ensure_ascii=False)
+    assert llm.answer("Τι γίνεται με την Ταβέρνα Δοκιμή;", CHAT_CONTEXT) == {
+        "text": text, "source": "AI"}
+    assert len(ollama["calls"]) == 1
+    system = ollama["calls"][0]["body"]["messages"][0]["content"]
+    assert llm.EXACT_NUMBERS in system  # strict rule already in the first try
+
+
+def test_invented_amount_retries_once_then_gives_the_fallback(ollama):
+    ollama["reply"] = json.dumps({"text": "Ο 30.00.0036 θα αγοράσει για 1.250 €."},
+                                 ensure_ascii=False)
+    out = llm.answer("Τι κάνει ο 1036;", CHAT_CONTEXT)
+    assert out == {"text": llm.NO_SURE_ANSWER, "source": "ΠΡΟΤΥΠΟ"}
+    assert out["text"] == ("Δεν βρήκα σίγουρη απάντηση. Δοκίμασε πιο συγκεκριμένη ερώτηση, "
+                           "π.χ. \"Γιατί έκτακτο δρομολόγιο;\"")
+    assert len(ollama["calls"]) == 2
+    retry = ollama["calls"][1]["body"]["messages"][0]["content"]
+    assert "ΠΡΟΣΟΧΗ" in retry and llm.EXACT_NUMBERS in retry
+
+
+def test_second_try_can_fix_the_answer(ollama, monkeypatch):
+    replies = iter(['{"text": "Αξία 1.250 €."}', '{"text": "Αξία 512,4 €."}'])
+    monkeypatch.setattr(llm, "chat", lambda *a, **k: next(replies))
+    out = llm.answer("Τι αξία έχει;", CHAT_CONTEXT)
+    assert out == {"text": "Αξία 512,4 €.", "source": "AI"}
+
+
+def test_dashboard_contexts_have_name_trdr_and_code():
+    from app import helpers as h
+    s = {"id": 1, "status": h.PROPOSED, "action_type": "ΠΑΡΑΓΓΕΛΙΑ", "trdr": 1036,
+         "delivery_date": "2026-11-04", "value_eur": 512.4, "priority": 1,
+         "payload": {"LINES": [], "FLAGS": []}}
+    cmap = {1036: ("Ταβέρνα Δοκιμή", "30.00.0036")}
+    one = h.suggestion_context(s, cmap)
+    assert (one["customer_name"], one["trdr"], one["customer_code"]) == (
+        "Ταβέρνα Δοκιμή", 1036, "30.00.0036")
+    brief = h.general_context([s], cmap)["top_suggestions"][0]
+    assert (brief["customer"], brief["trdr"], brief["customer_code"]) == (
+        "Ταβέρνα Δοκιμή", 1036, "30.00.0036")
